@@ -1,0 +1,58 @@
+version: '3.8'
+
+# ============================================================
+# 智能体记忆系统 — 开发环境（按需启动）
+#
+#   docker compose up -d                  # PG + Qdrant
+#   docker compose --profile gpu up -d    # + Ollama
+# ============================================================
+
+services:
+  # ---- PostgreSQL + pgvector ----
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mem-postgres
+    environment:
+      POSTGRES_USER: memuser
+      POSTGRES_PASSWORD: mempassword
+      POSTGRES_DB: agent_memory
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # ---- Qdrant 向量数据库 ----
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: mem-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  # ---- Ollama（可选，需 GPU）----
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mem-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    profiles:
+      - gpu
+
+volumes:
+  pgdata:
+  qdrant_data:
+  ollama_data:

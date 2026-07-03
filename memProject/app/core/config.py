@@ -1,0 +1,174 @@
+# -*- coding: utf-8 -*-
+"""
+核心配置模块 — 读取 YAML + 环境变量，提供统一配置访问。
+"""
+
+import os
+import re
+from pathlib import Path
+from typing import Optional
+
+import yaml
+from dotenv import load_dotenv
+from pydantic_settings import BaseSettings
+
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
+
+
+class AppConfig(BaseSettings):
+    name: str = "Agent Memory System"
+    version: str = "1.0.0"
+    debug: bool = True
+    secret_key: str = ""
+
+
+class ServerConfig(BaseSettings):
+    host: str = "0.0.0.0"
+    port: int = 8000
+    workers: int = 1
+
+
+class DatabaseConfig(BaseSettings):
+    driver: str = "postgresql+asyncpg"
+    host: str = "localhost"
+    port: int = 5432
+    user: str = "memuser"
+    password: str = "mempassword"
+    database: str = "agent_memory"
+    pool_size: int = 10
+    max_overflow: int = 5
+    pool_recycle: int = 3600
+
+    @property
+    def url(self) -> str:
+        return f"{self.driver}://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+    @property
+    def sync_url(self) -> str:
+        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+
+class Mem0Config(BaseSettings):
+    vector_store: dict = {}
+    history_store: dict = {}
+    llm: dict = {}
+    embedder: dict = {}
+
+
+class KafkaConfig(BaseSettings):
+    bootstrap_servers: str = "localhost:9092"
+    topic_memory_write: str = "memory.async.write"
+    topic_memory_generate: str = "memory.async.generate"
+    consumer_group: str = "memory-system"
+
+
+class RetrievalConfig(BaseSettings):
+    default_top_k: int = 10
+    max_top_k: int = 50
+    vector_weight: float = 0.4
+    keyword_weight: float = 0.2
+    recency_weight: float = 0.15
+    importance_weight: float = 0.15
+    confidence_weight: float = 0.1
+
+
+class GenerationConfig(BaseSettings):
+    extraction_batch_size: int = 20
+    schedule_interval_minutes: int = 5
+    max_memory_text_length: int = 2000
+    max_summary_length: int = 500
+
+
+class CompressionConfig(BaseSettings):
+    trigger_session_length: int = 30
+    compressed_context_length: int = 3000
+    preserve_critical_info: bool = True
+
+
+class AuthConfig(BaseSettings):
+    jwt_secret_key: str = ""
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 1440
+    api_key_header: str = "X-API-Key"
+
+
+class LoggingConfig(BaseSettings):
+    level: str = "INFO"
+    format: str = "text"
+    output: str = "both"
+
+
+class MonitoringConfig(BaseSettings):
+    prometheus_enabled: bool = False
+    metrics_port: int = 9090
+
+
+class Settings(BaseSettings):
+    app: AppConfig = AppConfig()
+    server: ServerConfig = ServerConfig()
+    database: DatabaseConfig = DatabaseConfig()
+    mem0: Mem0Config = Mem0Config()
+    kafka: KafkaConfig = KafkaConfig()
+    retrieval: RetrievalConfig = RetrievalConfig()
+    generation: GenerationConfig = GenerationConfig()
+    compression: CompressionConfig = CompressionConfig()
+    auth: AuthConfig = AuthConfig()
+    logging: LoggingConfig = LoggingConfig()
+    monitoring: MonitoringConfig = MonitoringConfig()
+
+
+def _resolve_env_vars(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    pattern = re.compile(r'\$\{(\w+)(?::-([^}]*))?\}')
+    def replacer(match):
+        var_name = match.group(1)
+        default = match.group(2)
+        return os.environ.get(var_name, default if default is not None else "")
+    return pattern.sub(replacer, value)
+
+
+def _resolve_dict(d: dict) -> dict:
+    result = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            result[k] = _resolve_dict(v)
+        elif isinstance(v, str):
+            result[k] = _resolve_env_vars(v)
+        else:
+            result[k] = v
+    return result
+
+
+def load_settings(config_path: Optional[str] = None) -> Settings:
+    if config_path is None:
+        config_path = Path(__file__).parent.parent.parent / "config" / "settings.yaml"
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    resolved = _resolve_dict(raw)
+
+    return Settings(
+        app=AppConfig(**resolved.get("app", {})),
+        server=ServerConfig(**resolved.get("server", {})),
+        database=DatabaseConfig(**resolved.get("database", {})),
+        mem0=Mem0Config(**resolved.get("mem0", {})),
+        kafka=KafkaConfig(**resolved.get("kafka", {})),
+        retrieval=RetrievalConfig(**resolved.get("retrieval", {})),
+        generation=GenerationConfig(**resolved.get("generation", {})),
+        compression=CompressionConfig(**resolved.get("compression", {})),
+        auth=AuthConfig(**resolved.get("auth", {})),
+        logging=LoggingConfig(**resolved.get("logging", {})),
+        monitoring=MonitoringConfig(**resolved.get("monitoring", {})),
+    )
+
+
+_settings: Optional[Settings] = None
+
+
+def get_settings() -> Settings:
+    global _settings
+    if _settings is None:
+        _settings = load_settings()
+    return _settings

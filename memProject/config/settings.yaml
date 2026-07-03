@@ -1,0 +1,97 @@
+# ============================================================
+# 智能体记忆系统 - 全局配置
+# ============================================================
+
+app:
+  name: "Agent Memory System"
+  version: "1.0.0"
+  debug: true
+  secret_key: "${SECRET_KEY}"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+
+# PostgreSQL 数据库配置
+database:
+  driver: "postgresql+asyncpg"
+  host: "${DB_HOST:-localhost}"
+  port: "${DB_PORT:-5432}"
+  user: "${DB_USER:-memuser}"
+  password: "${DB_PASSWORD:-mempassword}"
+  database: "${DB_NAME:-agent_memory}"
+  pool_size: 10
+  max_overflow: 5
+  pool_recycle: 3600
+
+# mem0 配置（history_store 使用 PG，vector_store 使用 Qdrant）
+mem0:
+  vector_store:
+    provider: "qdrant"
+    config:
+      host: "${QDRANT_HOST:-localhost}"
+      port: 6334
+      grpc_port: 6334
+      embedding_model_dims: 1024
+  history_store:
+    provider: "postgresql"
+    config:
+      host: "${DB_HOST:-localhost}"
+      port: "${DB_PORT:-5432}"
+      user: "${DB_USER:-memuser}"
+      password: "${DB_PASSWORD:-mempassword}"
+      database: "${DB_NAME:-agent_memory}"
+  llm:
+    provider: "openai"
+    config:
+      model: "${LLM_MODEL:-deepseek-chat}"
+      api_key: "${DEEPSEEK_API_KEY}"
+      openai_base_url: "https://api.deepseek.com/v1"
+  embedder:
+    provider: "openai"
+    config:
+      model: "BAAI/bge-m3"
+      api_key: "${SILICONFLOW_API_KEY}"
+      openai_base_url: "https://api.siliconflow.cn/v1"
+
+# 检索配置
+retrieval:
+  default_top_k: 10
+  max_top_k: 50
+  vector_weight: 0.4
+  keyword_weight: 0.2
+  recency_weight: 0.15
+  importance_weight: 0.15
+  confidence_weight: 0.1
+
+# 记忆生成配置
+generation:
+  extraction_batch_size: 20
+  schedule_interval_minutes: 5
+  max_memory_text_length: 2000
+  max_summary_length: 500
+
+# 记忆压缩配置
+compression:
+  trigger_session_length: 30
+  compressed_context_length: 3000
+  preserve_critical_info: true
+
+# 认证配置
+auth:
+  jwt_secret_key: "${JWT_SECRET_KEY}"
+  jwt_algorithm: "HS256"
+  jwt_expire_minutes: 1440
+  api_key_header: "X-API-Key"
+
+# 日志配置
+logging:
+  level: "${LOG_LEVEL:-INFO}"
+  format: "text"
+  output: "both"
+
+# 监控配置
+monitoring:
+  prometheus_enabled: false
+  metrics_port: 9090
