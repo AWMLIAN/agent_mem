@@ -13,7 +13,7 @@ API v1 路由聚合器 — 按模块注册子路由。
 
 from fastapi import APIRouter
 
-from app.api.v1 import agent, scene, session, task, memory, admin
+from app.api.v1 import agent, scene, session, task, memory, generation, admin
 
 api_router = APIRouter()
 
@@ -25,6 +25,7 @@ api_router.include_router(task.router, prefix="/task", tags=["Task"])
 
 # Phase 2-4: 记忆核心 API
 api_router.include_router(memory.router, prefix="/memory", tags=["Memory"])
+api_router.include_router(generation.router, prefix="/memory", tags=["Memory Generation"])
 
 # Phase 5: 管理后台
 api_router.include_router(admin.router, prefix="/admin", tags=["Admin"])
