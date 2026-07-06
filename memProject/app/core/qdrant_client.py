@@ -1,0 +1,178 @@
+# -*- coding: utf-8 -*-
+"""
+Qdrant Client 单例 — 复用 gRPC 连接模式进行向量存储与检索。
+
+与 mem0_client.py 中的 QdrantClient 模式一致：gRPC 端口 6334。
+"""
+from typing import Optional
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    PointStruct,
+    VectorParams,
+)
+
+from app.core.exceptions import VectorStoreError
+from app.core.logger import get_logger
+
+logger = get_logger("qdrant_client")
+
+QDRANT_HOST = "localhost"
+QDRANT_GRPC_PORT = 6334
+COLLECTION_NAME = "agent_mem_generation"  # 独立 collection，不影响 mem0 的 openmemory
+VECTOR_DIM = 1024  # bge-m3 维度
+DEFAULT_SCORE_THRESHOLD = 0.70
+
+
+class QdrantClientSingleton:
+    """Qdrant gRPC 客户端单例，用于记忆去重的向量检索。"""
+
+    def __init__(self) -> None:
+        self._client: Optional[QdrantClient] = None
+        self._collection_name: str = COLLECTION_NAME
+
+    def initialize(self) -> bool:
+        """初始化 Qdrant gRPC 连接并确保 collection 存在。"""
+        try:
+            self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_GRPC_PORT, prefer_grpc=True)
+
+            # 确保 collection 存在
+            collections = self._client.get_collections()
+            collection_names = [c.name for c in collections.collections]
+
+            if self._collection_name not in collection_names:
+                self._client.create_collection(
+                    collection_name=self._collection_name,
+                    vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
+                )
+                logger.info(f"Qdrant collection '{self._collection_name}' created (dim={VECTOR_DIM})")
+            else:
+                # 验证维度
+                info = self._client.get_collection(self._collection_name)
+                actual_dim = info.config.params.vectors.size
+                if actual_dim != VECTOR_DIM:
+                    logger.warning(
+                        f"Qdrant collection '{self._collection_name}' dim mismatch: "
+                        f"expected {VECTOR_DIM}, got {actual_dim}. Recreating."
+                    )
+                    self._client.delete_collection(self._collection_name)
+                    self._client.create_collection(
+                        collection_name=self._collection_name,
+                        vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
+                    )
+
+            logger.info(f"Qdrant client initialized: {QDRANT_HOST}:{QDRANT_GRPC_PORT}, collection='{self._collection_name}'")
+            return True
+        except Exception as e:
+            logger.error(f"Qdrant initialization failed: {e}")
+            return False
+
+    @property
+    def client(self) -> QdrantClient:
+        if self._client is None:
+            raise VectorStoreError("Qdrant 客户端未初始化，请先调用 initialize()")
+        return self._client
+
+    @property
+    def is_available(self) -> bool:
+        return self._client is not None
+
+    @property
+    def collection_name(self) -> str:
+        return self._collection_name
+
+    def search_similar(
+        self,
+        query_vector: list[float],
+        user_id: str,
+        top_k: int = 5,
+        score_threshold: float = DEFAULT_SCORE_THRESHOLD,
+    ) -> list[dict]:
+        """
+        按语义相似度检索最相近的记忆向量。
+
+        Args:
+            query_vector: 查询向量 (1024 维)
+            user_id: 限定用户范围
+            top_k: 返回 Top-K 条
+            score_threshold: 最低相似度阈值
+
+        Returns:
+            [{"id": str, "score": float, "payload": dict}, ...]
+        """
+        try:
+            hits = self.client.search(
+                collection_name=self._collection_name,
+                query_vector=query_vector,
+                query_filter={
+                    "must": [
+                        {"key": "user_id", "match": {"value": user_id}},
+                    ]
+                },
+                limit=top_k,
+                score_threshold=score_threshold,
+            )
+
+            results = [
+                {
+                    "id": hit.id,
+                    "score": hit.score,
+                    "payload": hit.payload or {},
+                }
+                for hit in hits
+            ]
+            logger.info(
+                f"Qdrant search: user={user_id}, top_k={top_k}, found={len(results)}"
+            )
+            return results
+        except Exception as e:
+            logger.error(f"Qdrant search failed: {e}")
+            raise VectorStoreError(f"Qdrant 检索失败: {str(e)}")
+
+    def upsert_vectors(
+        self,
+        vectors: list[list[float]],
+        payloads: list[dict],
+        ids: list[str],
+    ) -> None:
+        """
+        批量写入/更新向量。
+
+        Args:
+            vectors: 向量列表
+            payloads: 每个向量的 payload（含 user_id, memory_id 等）
+            ids: 每个向量的唯一标识（使用 memory_id）
+        """
+        if len(vectors) != len(payloads) or len(vectors) != len(ids):
+            raise ValueError("vectors, payloads, ids 长度必须一致")
+
+        try:
+            points = [
+                PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i])
+                for i in range(len(ids))
+            ]
+            self.client.upsert(
+                collection_name=self._collection_name,
+                points=points,
+            )
+            logger.info(f"Qdrant upsert: {len(points)} vectors")
+        except Exception as e:
+            logger.error(f"Qdrant upsert failed: {e}")
+            raise VectorStoreError(f"Qdrant 写入失败: {str(e)}")
+
+    def delete_vectors(self, ids: list[str]) -> None:
+        """删除指定 ID 的向量。"""
+        try:
+            self.client.delete(
+                collection_name=self._collection_name,
+                points_selector=ids,
+            )
+            logger.info(f"Qdrant delete: {len(ids)} vectors")
+        except Exception as e:
+            logger.error(f"Qdrant delete failed: {e}")
+            # 删除失败不抛异常（非致命）
+
+
+# 模块级单例
+qdrant_client = QdrantClientSingleton()
