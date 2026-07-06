@@ -62,6 +62,7 @@ class MemorySearchRequest(BaseModel):
     time_end: Optional[datetime] = Field(None, description="时间范围-结束")
     include_inactive: bool = Field(default=False, description="是否包含失效记忆")
     include_scores: bool = Field(default=True, description="是否返回评分明细")
+    rerank: bool = Field(default=False, description="是否启用 Reranker 二次排序（增加 150-200ms 延迟）")
 
 
 class MemoryItem(BaseModel):

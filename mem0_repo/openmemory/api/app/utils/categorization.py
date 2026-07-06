@@ -8,7 +8,11 @@ from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
-openai_client = OpenAI()
+import os
+openai_client = OpenAI(
+    api_key=os.environ.get("LLM_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
+    base_url=os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1"),
+)
 
 
 class MemoryCategories(BaseModel):
@@ -25,7 +29,7 @@ def get_categories_for_memory(memory: str) -> List[str]:
 
         # Let OpenAI handle the pydantic parsing directly
         completion = openai_client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
+            model=os.environ.get("LLM_MODEL", "deepseek-chat"),
             messages=messages,
             response_format=MemoryCategories,
             temperature=0

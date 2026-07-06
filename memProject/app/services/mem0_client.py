@@ -19,6 +19,7 @@ class Mem0Client:
 
     def __init__(self):
         self._client: Optional[Mem0Memory] = None
+        self._initialized = False
 
     def initialize(self) -> bool:
         try:
@@ -50,14 +51,18 @@ class Mem0Client:
                 },
             }
             self._client = Mem0Memory.from_config(config_dict=config)
+            self._initialized = True
             logger.info("mem0 client initialized successfully")
             return True
         except Exception as e:
+            self._initialized = True
             logger.warning(f"mem0 init failed (degraded): {e}")
             return False
 
     @property
     def client(self) -> Optional[Mem0Memory]:
+        if not self._initialized:
+            self.initialize()
         return self._client
 
     @property
@@ -84,13 +89,13 @@ class Mem0Client:
 
     def search(self, query: str, *, user_id: str, agent_id: Optional[str] = None,
                      session_id: Optional[str] = None, limit: int = 10,
-                     filters: Optional[dict] = None) -> list[dict]:
+                     filters: Optional[dict] = None, rerank: bool = False) -> dict:
         self._check()
         f = {"user_id": user_id}
         if filters: f.update(filters)
         try:
-            result = self.client.search(query, filters=f, limit=limit)
-            logger.info(f"mem0 search: '{query[:50]}...' → {len(result)} results")
+            result = self.client.search(query, filters=f, top_k=limit, rerank=rerank)
+            logger.info(f"mem0 search: '{query[:50]}...' → {len(result.get('results',[]))} results")
             return result
         except Exception as e:
             logger.error(f"mem0 search failed: {e}")

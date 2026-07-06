@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""记忆核心 API — 通过 MCP Client 调用 OpenMemory MCP Server。"""
+"""记忆核心 API。写入走 MCP，检索走 mem0 多信号融合。"""
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,10 +18,23 @@ from app.schemas.memory import (
 router = APIRouter()
 
 
-@router.post("/write", summary="存储记忆（MCP add_memories）")
+@router.post("/write", summary="存储记忆（直接调 mem0，支持 metadata）")
 async def memory_write(body: MemoryWriteRequest, db: AsyncSession = Depends(get_db)):
+    from app.services.mem0_client import mem0_client as mc
+    # 构建 metadata：存入自定义字段，供检索时过滤
+    meta = {}
+    if body.scene_id: meta["scene_id"] = body.scene_id
+    if body.session_id: meta["session_id"] = body.session_id
+    if body.task_id: meta["task_id"] = body.task_id
     text = body.messages[0].content if body.messages else ""
-    result = await mcp_client.add_memories(text=text, user_id=body.user_id)
+    # 要求 LLM 用中文抽取记忆，确保中文关键词检索可用
+    messages = [{"role": msg.role, "content": msg.content} for msg in body.messages]
+    messages.insert(0, {"role": "system", "content": "请用中文提取和记录所有记忆内容。"})
+    result = mc.add(
+        messages,
+        user_id=body.user_id,
+        metadata=meta or None,
+    )
     return ok(result)
 
 
@@ -30,9 +43,24 @@ async def memory_async_write(body: MemoryWriteRequest):
     return ok({"request_id": "placeholder", "status": "accepted"})
 
 
-@router.post("/search", summary="检索记忆（MCP search_memory）")
+@router.post("/search", summary="多信号融合检索（语义+BM25+实体+元数据过滤）")
 async def memory_search(body: MemorySearchRequest, db: AsyncSession = Depends(get_db)):
-    result = await mcp_client.search_memory(query=body.query, user_id=body.user_id)
+    from app.services.retrieval_service import search as retrieval_search
+    result = retrieval_search(
+        query=body.query,
+        user_id=body.user_id,
+        agent_id=body.agent_id,
+        scene_id=body.scene_id,
+        session_id=body.session_id,
+        task_id=body.task_id,
+        memory_types=body.memory_types,
+        time_start=body.time_start.isoformat() if body.time_start else None,
+        time_end=body.time_end.isoformat() if body.time_end else None,
+        top_k=body.top_k,
+        include_inactive=body.include_inactive,
+        include_scores=body.include_scores,
+        rerank=body.rerank,
+    )
     return ok(result)
 
 
