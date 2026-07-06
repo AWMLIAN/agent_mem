@@ -54,8 +54,8 @@ You can do this in one of the following ways:
   Copy and rename the example files:
 
   ```bash
-  cp api/.env.example api/.env
-  cp ui/.env.example ui/.env
+  cp api/.env api/.env
+  cp ui/.env ui/.env
   ```
 
  - **Using Makefile** (if supported):  

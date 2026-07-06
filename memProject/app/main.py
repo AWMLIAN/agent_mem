@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.database import check_db_connection, create_pgvector_extension
 from app.core.logger import setup_logging, get_logger
-from app.middleware import LoggingMiddleware, register_exception_handlers, AuthMiddleware
+from app.middleware import LoggingMiddleware, register_exception_handlers, AuthMiddleware, ApiLogMiddleware
 from app.services.mem0_client import mem0_client
 
 settings = get_settings()
@@ -50,6 +50,7 @@ app = FastAPI(
 register_exception_handlers(app)
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(AuthMiddleware)
+app.add_middleware(ApiLogMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

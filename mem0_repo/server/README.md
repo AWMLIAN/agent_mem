@@ -16,7 +16,7 @@ Copy the example env file and set a Postgres password (required):
 
 ```bash
 cd server
-cp .env.example .env
+cp .env .env
 # Edit .env — at minimum set POSTGRES_PASSWORD and OPENAI_API_KEY
 ```
 
