@@ -86,6 +86,7 @@ class CompressionConfig(BaseSettings):
 
 
 class AuthConfig(BaseSettings):
+    enabled: bool = False
     jwt_secret_key: str = ""
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440
