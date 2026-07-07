@@ -247,7 +247,7 @@ class MemoryUpdateRequest(BaseModel):
     memory_id: str = Field(..., description="记忆唯一标识")
     content: Optional[str] = Field(None, description="更新后的记忆内容")
     summary: Optional[str] = Field(None)
-    status: Optional[str] = Field(None, description="状态: active/inactive/pending_update/conflict/deleted")
+    status: Optional[str] = Field(None, description="状态: active/deleted/pending_update/conflict")
     importance: Optional[float] = Field(None, ge=0, le=1)
     confidence: Optional[float] = Field(None, ge=0, le=1)
     tags: Optional[list[str]] = Field(None)

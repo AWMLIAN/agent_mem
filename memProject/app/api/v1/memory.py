@@ -28,6 +28,14 @@ from app.schemas.memory import (
     ContextRequest, MemoryUpdateRequest, MemoryDeleteRequest,
 )
 from app.services.validation_service import validate_and_standardize
+from app.services.memory_service import (
+    get_memory_by_id,
+    update_memory_fields,
+    soft_delete_memory,
+    build_context_query,
+    get_stats,
+    get_memory_relations,
+)
 
 logger = get_logger("memory_api")
 router = APIRouter()
@@ -195,16 +203,107 @@ async def memory_search(
 # ============================================================
 
 @router.post("/context", summary="Prompt 上下文片段")
-async def memory_context(body: ContextRequest, db: AsyncSession = Depends(get_db), _agent: str = Depends(get_current_agent)):
-    return ok({"fragments": [], "formatted_text": "", "memory_count": 0})
+async def memory_context(
+    body: ContextRequest,
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    filters = {
+        "user_id": body.user_id,
+        "agent_id": body.agent_id,
+        "scene_id": body.scene_id,
+        "session_id": body.session_id,
+        "task_id": body.task_id,
+        "include_map": {
+            "preferences": body.include_preferences,
+            "facts": body.include_facts,
+            "task_state": body.include_task_state,
+        },
+    }
+    memories = await build_context_query(db, filters)
+    fragments = []
+    for m in memories:
+        fragments.append({
+            "memory_type": m.memory_type,
+            "content": m.content,
+            "memory_ids": [m.memory_id],
+        })
+    formatted = "\n\n".join(f"[{m.memory_type}] {m.content}" for m in memories)
+    return ok({
+        "fragments": fragments,
+        "formatted_text": formatted,
+        "memory_count": len(memories),
+        "estimated_tokens": len(formatted) // 2,
+    })
 
 @router.put("/update", summary="更新记忆")
-async def memory_update(body: MemoryUpdateRequest, db: AsyncSession = Depends(get_db), _agent: str = Depends(get_current_agent)):
-    return ok({"memory_id": body.memory_id, "updated": True})
+async def memory_update(
+    body: MemoryUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    updates = {k: v for k, v in body.model_dump(exclude={"memory_id"}, exclude_none=True).items() if v is not None}
+    memory = await update_memory_fields(db, body.memory_id, updates)
+    return ok({"memory_id": memory.memory_id, "updated": True, "version": memory.version})
 
 @router.delete("/delete", summary="删除记忆（软删除）")
-async def memory_delete(body: MemoryDeleteRequest, db: AsyncSession = Depends(get_db), _agent: str = Depends(get_current_agent)):
-    return ok({"memory_id": body.memory_id, "deleted": True})
+async def memory_delete(
+    body: MemoryDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    memory_id, previous_status = await soft_delete_memory(db, body.memory_id)
+    return ok({"memory_id": memory_id, "deleted": True, "previous_status": previous_status})
+
+
+@router.get("/stats", summary="记忆统计")
+async def memory_stats(
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    stats = await get_stats(db)
+    return ok(stats)
+
+
+@router.get("/{memory_id}", summary="查询单条记忆")
+async def memory_get(
+    memory_id: str,
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    memory = await get_memory_by_id(db, memory_id)
+    if not memory:
+        from app.core.exceptions import NotFoundError
+        raise NotFoundError(f"记忆 {memory_id} 不存在")
+    return ok({
+        "memory_id": memory.memory_id,
+        "content": memory.content,
+        "summary": memory.summary,
+        "key_points": memory.key_points,
+        "memory_type": memory.memory_type,
+        "status": memory.status,
+        "importance": memory.importance,
+        "confidence": memory.confidence,
+        "tags": memory.tags,
+        "user_id": memory.user_id,
+        "agent_id": memory.agent_id,
+        "scene_id": memory.scene_id,
+        "session_id": memory.session_id,
+        "task_id": memory.task_id,
+        "version": memory.version,
+        "created_at": memory.created_at.isoformat() if memory.created_at else None,
+        "updated_at": memory.updated_at.isoformat() if memory.updated_at else None,
+    })
+
+
+@router.get("/{memory_id}/relations", summary="查询记忆关系")
+async def memory_relations(
+    memory_id: str,
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    relations = await get_memory_relations(db, memory_id)
+    return ok({"memory_id": memory_id, "relations": relations})
 
 @router.post("/list", summary="列出全部记忆")
 async def memory_list(user_id: str = Query(...)):

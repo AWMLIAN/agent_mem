@@ -1,19 +1,39 @@
 # -*- coding: utf-8 -*-
 from app.services.mem0_client import mem0_client, Mem0Client
-from app.services.validation_service import validate_and_standardize, ValidationResult
-from app.services.llm_client import llm_client, LLMClient
-from app.services.embedding_client import embedding_client, EmbeddingClient
-from app.services.memory_pipeline import memory_pipeline, MemoryPipeline
+from app.services.memory_service import (
+    create_memory,
+    get_memory_by_id,
+    update_memory_fields,
+    soft_delete_memory,
+    save_interaction_records,
+    search_local,
+    list_memories_filtered,
+    build_context_query,
+    log_retrieval_request,
+    log_retrieval_results,
+    get_stats,
+    get_memory_relations,
+    gen_memory_id,
+    gen_record_id,
+    gen_request_id,
+)
 
 __all__ = [
     "mem0_client",
     "Mem0Client",
-    "validate_and_standardize",
-    "ValidationResult",
-    "llm_client",
-    "LLMClient",
-    "embedding_client",
-    "EmbeddingClient",
-    "memory_pipeline",
-    "MemoryPipeline",
+    "create_memory",
+    "get_memory_by_id",
+    "update_memory_fields",
+    "soft_delete_memory",
+    "save_interaction_records",
+    "search_local",
+    "list_memories_filtered",
+    "build_context_query",
+    "log_retrieval_request",
+    "log_retrieval_results",
+    "get_stats",
+    "get_memory_relations",
+    "gen_memory_id",
+    "gen_record_id",
+    "gen_request_id",
 ]
