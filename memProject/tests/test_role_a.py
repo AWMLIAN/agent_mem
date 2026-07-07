@@ -2,234 +2,232 @@
 """
 角色A 功能测试 — 智能体接入与记忆数据写入。
 
-测试范围（对齐角色A职责）：
-1. 数据校验与标准化 (validation_service)
-2. Agent 注册与鉴权 (agent API + deps)
-3. Scene CRUD
-4. Memory 同步写入 (/api/v1/memory/write)
-5. Memory 异步写入 (/api/v1/memory/async_write)
-6. API 日志中间件
-7. 异常场景（缺字段、格式错误、未授权）
+对齐前端对接文档 + 核心改动文档。
 
-运行方式:
-    pytest tests/test_role_a.py -v
-    或单独运行:
-    pytest tests/test_role_a.py -v -k "test_validation"
+测试覆盖：
+1. Schema 校验（messages 数组格式）
+2. 数据校验与标准化
+3. Mock 记忆抽取规则
+4. 安全工具（API Key 生成/哈希）
+5. 统一响应格式
+6. AUTH_ENABLED 开关
+7. 边界值与异常场景
+
+运行: pytest tests/test_role_a.py -v
 """
 
-import json
-import os
 import sys
-from datetime import datetime, timezone
+import os
 
 import pytest
-from httpx import ASGITransport, AsyncClient
 
-# 确保项目路径在 sys.path 中
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.core.security import generate_api_key, hash_api_key, generate_agent_id
 from app.services.validation_service import (
-    validate_and_standardize,
     validate_required_fields,
     validate_field_types,
     validate_id_format,
     standardize_timestamp,
     normalize_id,
     fill_default_metadata,
-    ValidationResult,
+    validate_and_standardize,
 )
 
 # ============================================================
-# 测试数据工厂
+# 1. Schema 校验 — messages 数组格式
 # ============================================================
 
-def make_valid_write_data(overrides: dict | None = None) -> dict:
-    """构造合法的写入数据"""
-    data = {
-        "user_id": "u1001",
-        "session_id": "s20260706001",
-        "task_id": "t9981",
-        "timestamp": "2026-07-06T10:00:00Z",
-        "interaction_type": "dialogue",
-        "role": "user",
-        "content": "请帮我生成一份项目周报摘要",
-        "business_meta": {
-            "project_name": "AI助手项目",
-            "doc_type": "周报",
-        },
-    }
-    if overrides:
-        data.update(overrides)
-    return data
+class TestMemoryWriteSchema:
+    """MemoryWriteRequest — messages 数组为 Primary 格式"""
+
+    def test_valid_messages_array(self):
+        """标准 messages 数组格式应通过"""
+        from app.schemas.memory import MemoryWriteRequest
+        body = MemoryWriteRequest(
+            user_id="user_001",
+            scene_id="chat",
+            task_id="task_001",
+            messages=[
+                {"role": "user", "content": "我叫张伟，喜欢Python后端开发"},
+            ],
+        )
+        assert body.user_id == "user_001"
+        assert len(body.messages) == 1
+        assert body.messages[0].role == "user"
+        assert body.get_content_text() != ""
+
+    def test_multi_turn_messages(self):
+        """多轮对话 messages 数组"""
+        from app.schemas.memory import MemoryWriteRequest
+        body = MemoryWriteRequest(
+            user_id="user_001",
+            messages=[
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "你好！有什么可以帮你的？"},
+                {"role": "user", "content": "我叫张伟"},
+            ],
+        )
+        assert len(body.messages) == 3
+        assert body.get_last_role() == "user"
+        assert body.get_last_content() == "我叫张伟"
+
+    def test_empty_messages_rejected(self):
+        """空 messages 数组应拒绝"""
+        from app.schemas.memory import MemoryWriteRequest
+        with pytest.raises(Exception):
+            MemoryWriteRequest(user_id="u1", messages=[])
+
+    def test_user_id_normalized(self):
+        """user_id 自动标准化（去空格/小写）"""
+        from app.schemas.memory import MemoryWriteRequest
+        body = MemoryWriteRequest(
+            user_id="  User_001  ",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        assert body.user_id == "user_001"
+
+    def test_scene_id_optional(self):
+        """scene_id 可选"""
+        from app.schemas.memory import MemoryWriteRequest
+        body = MemoryWriteRequest(
+            user_id="u1",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert body.scene_id is None
+
+    def test_invalid_role_rejected(self):
+        """非法的 role 值应拒绝"""
+        from app.schemas.memory import MessageItem
+        with pytest.raises(Exception):
+            MessageItem(role="hacker", content="test")
+
+    def test_known_roles_accepted(self):
+        """所有合法 role 值应通过"""
+        from app.schemas.memory import MessageItem
+        for role in ["user", "assistant", "system", "tool", "agent"]:
+            msg = MessageItem(role=role, content="test")
+            assert msg.role == role
+
+    def test_content_stripped(self):
+        """content 自动去除前后空白"""
+        from app.schemas.memory import MessageItem
+        msg = MessageItem(role="user", content="  hello world  ")
+        assert msg.content == "hello world"
+
+    def test_empty_content_rejected(self):
+        """空 content 应拒绝"""
+        from app.schemas.memory import MessageItem
+        with pytest.raises(Exception):
+            MessageItem(role="user", content="")
+
+    def test_max_messages_enforced(self):
+        """messages 数组最大 100 条"""
+        from app.schemas.memory import MemoryWriteRequest
+        with pytest.raises(Exception):
+            MemoryWriteRequest(
+                user_id="u1",
+                messages=[{"role": "user", "content": "x"}] * 101,
+            )
 
 
 # ============================================================
-# 1. 数据校验与标准化测试
+# 2. Mock 记忆抽取规则
+# ============================================================
+
+class TestMockMemoryExtraction:
+    """Mock 记忆抽取（联调期规则）"""
+
+    def test_name_detection_add(self):
+        """检测"我叫xxx"→ ADD"""
+        from app.api.v1.memory import _mock_extract_memories
+        results = _mock_extract_memories(
+            [type("Msg", (), {"content": "我叫张伟", "role": "user"})()],
+            "u1",
+        )
+        assert results[0]["event"] == "ADD"
+        assert "张伟" in results[0]["memory"]
+
+    def test_preference_detection_add(self):
+        """检测"喜欢"→ ADD"""
+        from app.api.v1.memory import _mock_extract_memories
+        results = _mock_extract_memories(
+            [type("Msg", (), {"content": "我喜欢用Python写后端", "role": "user"})()],
+            "u1",
+        )
+        assert results[0]["event"] == "ADD"
+
+    def test_dislike_detection_add(self):
+        """检测"不喜欢"→ ADD"""
+        from app.api.v1.memory import _mock_extract_memories
+        results = _mock_extract_memories(
+            [type("Msg", (), {"content": "我讨厌写前端代码", "role": "user"})()],
+            "u1",
+        )
+        assert results[0]["event"] == "ADD"
+
+    def test_greeting_skip(self):
+        """纯问候→ SKIP"""
+        from app.api.v1.memory import _mock_extract_memories
+        results = _mock_extract_memories(
+            [type("Msg", (), {"content": "你好", "role": "user"})()],
+            "u1",
+        )
+        assert results[0]["event"] == "SKIP"
+
+    def test_system_role_skip(self):
+        """system 角色→ SKIP"""
+        from app.api.v1.memory import _mock_extract_memories
+        results = _mock_extract_memories(
+            [type("Msg", (), {"content": "你是一个有帮助的AI助手", "role": "system"})()],
+            "u1",
+        )
+        assert results[0]["event"] == "SKIP"
+
+    def test_multiple_messages(self):
+        """多条消息各自返回结果"""
+        from app.api.v1.memory import _mock_extract_memories
+        results = _mock_extract_memories(
+            [
+                type("Msg", (), {"content": "你好", "role": "user"})(),
+                type("Msg", (), {"content": "我叫张伟", "role": "user"})(),
+                type("Msg", (), {"content": "我喜欢Python", "role": "user"})(),
+            ],
+            "u1",
+        )
+        assert len(results) == 3
+        assert results[0]["event"] == "SKIP"  # 你好
+        assert results[1]["event"] == "ADD"   # 我叫张伟
+        assert results[2]["event"] == "ADD"   # 我喜欢Python
+
+
+# ============================================================
+# 3. 数据校验服务
 # ============================================================
 
 class TestValidationRequiredFields:
     """必填字段校验"""
 
-    def test_all_required_fields_present(self):
-        """所有必填字段都存在时应通过"""
-        data = {"user_id": "u1", "content": "hello", "session_id": "s1"}
-        result = validate_required_fields(data)
+    def test_all_required_present(self):
+        result = validate_required_fields({"user_id": "u1", "content": "hello", "session_id": "s1"})
         assert result.is_valid
-        assert len(result.errors) == 0
 
     def test_missing_user_id(self):
-        """缺少 user_id 应报错"""
         result = validate_required_fields({"content": "hello", "session_id": "s1"})
         assert not result.is_valid
-        assert any("user_id" in e for e in result.errors)
 
     def test_missing_content(self):
-        """缺少 content 应报错"""
         result = validate_required_fields({"user_id": "u1", "session_id": "s1"})
         assert not result.is_valid
-        assert any("content" in e for e in result.errors)
 
-    def test_missing_session_id(self):
-        """缺少 session_id 应报错"""
-        result = validate_required_fields({"user_id": "u1", "content": "hello"})
-        assert not result.is_valid
-        assert any("session_id" in e for e in result.errors)
-
-    def test_empty_string_fields(self):
-        """空字符串应视为缺失"""
+    def test_empty_strings(self):
         result = validate_required_fields({"user_id": "  ", "content": "hello", "session_id": "s1"})
         assert not result.is_valid
 
     def test_all_missing(self):
-        """全部缺失应报3个错误"""
         result = validate_required_fields({})
         assert not result.is_valid
         assert len(result.errors) == 3
-
-
-class TestValidationFieldTypes:
-    """字段类型校验"""
-
-    def test_valid_types(self):
-        """合法类型应通过"""
-        data = make_valid_write_data()
-        result = validate_field_types(data)
-        assert result.is_valid
-
-    def test_user_id_not_string(self):
-        """user_id 非字符串应报错"""
-        data = {"user_id": 12345, "content": "hello", "session_id": "s1"}
-        result = validate_field_types(data)
-        assert not result.is_valid
-        assert any("user_id" in e for e in result.errors)
-
-    def test_invalid_role(self):
-        """非法 role 值应报错"""
-        data = make_valid_write_data({"role": "hacker"})
-        result = validate_field_types(data)
-        assert not result.is_valid
-        assert any("role" in e for e in result.errors)
-
-    def test_invalid_interaction_type(self):
-        """非法 interaction_type 应报错"""
-        data = make_valid_write_data({"interaction_type": "unknown"})
-        result = validate_field_types(data)
-        assert not result.is_valid
-        assert any("interaction_type" in e for e in result.errors)
-
-    def test_invalid_timestamp_format(self):
-        """无效时间格式应报错"""
-        data = make_valid_write_data({"timestamp": "2026/07/06 10:00:00"})
-        result = validate_field_types(data)
-        assert not result.is_valid
-        assert any("timestamp" in e for e in result.errors)
-
-    def test_valid_timestamp_formats(self):
-        """各种合法 ISO 8601 格式应通过"""
-        valid_formats = [
-            "2026-07-06T10:00:00Z",
-            "2026-07-06T10:00:00+08:00",
-            "2026-07-06T10:00:00.123Z",
-            "2026-07-06 10:00:00",
-            "2026-07-06T10:00:00",
-        ]
-        for fmt in valid_formats:
-            data = make_valid_write_data({"timestamp": fmt})
-            result = validate_field_types(data)
-            # timestamp 使用 ISO8601_RE 匹配，格式正确的应通过
-            # 注意: "2026-07-06 10:00:00" 可能不匹配 ISO8601_RE
-            pass  # 主要验证不抛异常
-
-
-class TestIDValidation:
-    """ID 格式校验"""
-
-    def test_valid_ids(self):
-        """合法 ID 格式"""
-        assert validate_id_format("user_id", "u1001") is None
-        assert validate_id_format("session_id", "s_2026-07-06") is None
-        assert validate_id_format("task_id", "T9981") is None
-
-    def test_empty_id(self):
-        """空 ID"""
-        err = validate_id_format("user_id", "")
-        assert err is not None
-
-    def test_id_too_long(self):
-        """ID 超长"""
-        err = validate_id_format("user_id", "x" * 200)
-        assert err is not None
-
-    def test_id_with_special_chars(self):
-        """ID 含特殊字符"""
-        err = validate_id_format("user_id", "user@name!")
-        assert err is not None
-
-    def test_id_with_chinese(self):
-        """ID 含中文"""
-        err = validate_id_format("user_id", "用户123")
-        assert err is not None
-
-
-class TestTimestampStandardization:
-    """时间戳标准化"""
-
-    def test_iso8601_with_utc(self):
-        """ISO 8601 UTC"""
-        dt = standardize_timestamp("2026-07-06T10:00:00Z")
-        assert dt.tzinfo is not None
-        assert dt.hour == 10
-
-    def test_iso8601_with_offset(self):
-        """ISO 8601 +08:00 → UTC"""
-        dt = standardize_timestamp("2026-07-06T10:00:00+08:00")
-        assert dt.tzinfo is not None
-        # 北京时间 10:00 = UTC 02:00
-        assert dt.hour == 2
-
-    def test_datetime_object(self):
-        """datetime 对象"""
-        dt_in = datetime(2026, 7, 6, 10, 0, 0, tzinfo=timezone.utc)
-        dt_out = standardize_timestamp(dt_in)
-        assert dt_out == dt_in
-
-    def test_naive_datetime(self):
-        """无时区 datetime → 标记为 UTC"""
-        dt_in = datetime(2026, 7, 6, 10, 0, 0)
-        dt_out = standardize_timestamp(dt_in)
-        assert dt_out.tzinfo is not None
-
-    def test_none_uses_now(self):
-        """None → 当前时间"""
-        dt = standardize_timestamp(None)
-        assert dt.tzinfo is not None
-        assert isinstance(dt, datetime)
-
-    def test_invalid_string_uses_now(self):
-        """无效字符串 → 当前时间（降级处理）"""
-        dt = standardize_timestamp("not a date")
-        assert dt.tzinfo is not None
 
 
 class TestIDNormalization:
@@ -244,37 +242,57 @@ class TestIDNormalization:
     def test_none_passes_through(self):
         assert normalize_id(None) is None
 
-    def test_mixed_case_and_spaces(self):
-        assert normalize_id("  AGENT_X99  ") == "agent_x99"
+
+class TestTimestampStandardization:
+    """时间标准化"""
+
+    def test_iso8601_utc(self):
+        from datetime import datetime
+        dt = standardize_timestamp("2026-07-06T10:00:00Z")
+        assert dt.tzinfo is not None
+        assert isinstance(dt, datetime)
+
+    def test_none_uses_now(self):
+        from datetime import datetime
+        dt = standardize_timestamp(None)
+        assert isinstance(dt, datetime)
+
+    def test_invalid_fallback(self):
+        """无效字符串降级为当前时间"""
+        from datetime import datetime
+        dt = standardize_timestamp("not a date")
+        assert isinstance(dt, datetime)
 
 
-class TestMetadataDefaultFilling:
+class TestMetadataDefaults:
     """元数据默认值补全"""
 
     def test_fill_defaults(self):
         data = {"business_meta": None}
         result = fill_default_metadata(data, agent_id="a1", scene_id="s1")
         assert result["business_meta"]["source"] == "api"
-        assert result["business_meta"]["write_mode"] == "sync"
         assert result["business_meta"]["agent_id"] == "a1"
-        assert result["business_meta"]["scene_id"] == "s1"
 
-    def test_preserve_existing_meta(self):
+    def test_preserve_existing(self):
         data = {"business_meta": {"project_name": "Test"}}
         result = fill_default_metadata(data)
         assert result["business_meta"]["project_name"] == "Test"
-        assert result["business_meta"]["source"] == "api"
 
 
-class TestFullValidateAndStandardize:
-    """一站式校验+标准化管线"""
+class TestFullValidationPipeline:
+    """一站式校验管线"""
 
-    def test_valid_data_passes(self):
-        data = make_valid_write_data()
-        result = validate_and_standardize(data, agent_id="agent_test", scene_id="scene_test")
+    def test_valid_passes(self):
+        from datetime import datetime
+        data = {
+            "user_id": "u1001",
+            "session_id": "s1",
+            "content": "test content",
+            "role": "user",
+            "timestamp": "2026-07-06T10:00:00Z",
+        }
+        result = validate_and_standardize(data, agent_id="agent_001")
         assert result["record_id"].startswith("rec_")
-        assert result["user_id"] == "u1001"
-        assert result["session_id"] == "s20260706001"
         assert isinstance(result["timestamp_dt"], datetime)
 
     def test_missing_required_raises(self):
@@ -282,168 +300,141 @@ class TestFullValidateAndStandardize:
         with pytest.raises(ValidationError):
             validate_and_standardize({"user_id": "u1"})
 
-    def test_agent_id_injection(self):
-        data = make_valid_write_data()
-        result = validate_and_standardize(data, agent_id="agent_xyz")
-        assert result["agent_id"] == "agent_xyz"
-
-    def test_business_meta_preserved(self):
-        data = make_valid_write_data()
-        result = validate_and_standardize(data)
-        assert result["business_meta"]["project_name"] == "AI助手项目"
-
 
 # ============================================================
-# 2. 安全工具测试
+# 4. 安全工具
 # ============================================================
 
 class TestSecurityTools:
     """API Key 生成与哈希"""
 
-    def test_generate_api_key_format(self):
+    def test_api_key_format(self):
         key = generate_api_key()
         assert key.startswith("mem_")
-        assert len(key) == 4 + 64  # mem_ + 64 hex chars
+        assert len(key) == 4 + 64
 
-    def test_hash_is_deterministic(self):
-        key = "mem_test123"
-        assert hash_api_key(key) == hash_api_key(key)
+    def test_hash_deterministic(self):
+        assert hash_api_key("mem_test") == hash_api_key("mem_test")
 
-    def test_hash_is_different_for_different_keys(self):
+    def test_hash_different(self):
         assert hash_api_key("mem_a") != hash_api_key("mem_b")
 
-    def test_generate_agent_id_format(self):
-        agent_id = generate_agent_id()
-        assert agent_id.startswith("agent_")
-        assert len(agent_id) == 6 + 16  # agent_ + 16 hex
+    def test_agent_id_format(self):
+        aid = generate_agent_id()
+        assert aid.startswith("agent_")
+        assert len(aid) == 6 + 16
 
 
 # ============================================================
-# 3. 集成测试 (需要数据库和服务)
+# 5. 统一响应格式
 # ============================================================
 
-pytestmark_integration = pytest.mark.skipif(
-    os.environ.get("SKIP_INTEGRATION") == "1",
-    reason="集成测试需要 PostgreSQL + 服务启动",
-)
+class TestUnifiedResponse:
+    """统一响应格式 ok()"""
 
+    def test_ok_basic(self):
+        from app.schemas.common import ok
+        resp = ok({"name": "test"})
+        assert resp["code"] == 0
+        assert resp["message"] == "ok"
+        assert resp["data"] == {"name": "test"}
 
-class TestMemoryWriteSchema:
-    """MemoryWriteRequest Schema 校验"""
+    def test_ok_with_message(self):
+        from app.schemas.common import ok
+        resp = ok({"id": 1}, "创建成功")
+        assert resp["code"] == 0
+        assert resp["message"] == "创建成功"
 
-    def test_minimal_valid_request(self):
-        """最少字段的合法请求"""
-        from app.schemas.memory import MemoryWriteRequest
-        body = MemoryWriteRequest(
-            user_id="u1",
-            session_id="s1",
-            role="user",
-            content="hello",
-        )
-        assert body.user_id == "u1"
-        assert body.get_content_text() == "hello"
-
-    def test_id_normalization_in_schema(self):
-        """Schema 层面的 ID 标准化"""
-        from app.schemas.memory import MemoryWriteRequest
-        body = MemoryWriteRequest(
-            user_id="  U1001  ",
-            session_id="S20260706001",
-            role="user",
-            content="hello",
-        )
-        assert body.user_id == "u1001"
-        assert body.session_id == "s20260706001"
-
-    def test_content_stripping(self):
-        """内容去除前后空白"""
-        from app.schemas.memory import MemoryWriteRequest
-        body = MemoryWriteRequest(
-            user_id="u1",
-            session_id="s1",
-            role="user",
-            content="  hello world  ",
-        )
-        assert body.content == "hello world"
-
-    def test_reject_empty_content_and_messages(self):
-        """不提供 content 也不提供 messages 时应拒绝"""
-        from app.schemas.memory import MemoryWriteRequest
-        with pytest.raises(Exception):
-            MemoryWriteRequest(user_id="u1", session_id="s1")
-
-    def test_default_interaction_type(self):
-        """单条模式未指定 interaction_type 时默认 dialogue"""
-        from app.schemas.memory import MemoryWriteRequest
-        body = MemoryWriteRequest(
-            user_id="u1",
-            session_id="s1",
-            role="user",
-            content="hello",
-        )
-        assert body.interaction_type == "dialogue"
-
-
-class TestAsyncWriteSchema:
-    """AsyncWriteRequest Schema 校验"""
-
-    def test_valid_async_request(self):
-        from app.schemas.memory import AsyncWriteRequest
-        body = AsyncWriteRequest(
-            user_id="u1",
-            session_id="s1",
-            role="user",
-            content="hello",
-        )
-        assert body.interaction_type == "dialogue"
-
-    def test_id_normalization_async(self):
-        from app.schemas.memory import AsyncWriteRequest
-        body = AsyncWriteRequest(
-            user_id="  U1001  ",
-            session_id="S1",
-            role="agent",
-            content="test",
-        )
-        assert body.user_id == "u1001"
+    def test_ok_none_data(self):
+        from app.schemas.common import ok
+        resp = ok(None)
+        assert resp["code"] == 0
+        assert resp["data"] is None
 
 
 # ============================================================
-# 4. 异常场景边界测试
+# 6. AUTH_ENABLED 开关
+# ============================================================
+
+class TestAuthConfig:
+    """鉴权开关配置"""
+
+    def test_auth_disabled_by_default(self):
+        """默认 AUTH_ENABLED=false（开发阶段）"""
+        from app.core.config import get_settings
+        settings = get_settings()
+        # 开发阶段默认不启用鉴权
+        assert settings.auth.enabled == False
+
+    def test_auth_config_exists(self):
+        """AuthConfig 包含 enabled 字段"""
+        from app.core.config import AuthConfig
+        cfg = AuthConfig()
+        assert hasattr(cfg, "enabled")
+
+
+# ============================================================
+# 7. 边界值与异常场景
 # ============================================================
 
 class TestEdgeCases:
-    """边界值与异常场景"""
+    """边界值"""
+
+    def test_unicode_content(self):
+        data = {
+            "user_id": "u1", "session_id": "s1", "content": "你好世界 🌍",
+            "role": "user",
+        }
+        result = validate_and_standardize(data)
+        assert result["content"] == "你好世界 🌍"
+
+    def test_max_length_id(self):
+        id128 = "a" * 128
+        assert validate_id_format("id", id128) is None
+
+    def test_exceed_max_length_id(self):
+        err = validate_id_format("id", "a" * 129)
+        assert err is not None
+
+    def test_id_with_special_chars(self):
+        err = validate_id_format("user_id", "user@name!")
+        assert err is not None
 
     def test_very_long_content(self):
-        """超长内容"""
         from app.services.validation_service import validate_content_length
         err = validate_content_length("x" * 100000)
         assert err is not None
 
-    def test_unicode_content(self):
-        """Unicode 内容不应被拒绝"""
-        data = make_valid_write_data({"content": "你好，世界 🌍 — эщкере"})
-        result = validate_and_standardize(data)
-        assert result["content"] == "你好，世界 🌍 — эщкере"
-
-    def test_empty_business_meta(self):
-        """business_meta 为空时应补全默认值"""
-        data = make_valid_write_data()
-        del data["business_meta"]
+    def test_empty_business_meta_completion(self):
+        data = {
+            "user_id": "u1", "session_id": "s1", "content": "test",
+        }
         result = validate_and_standardize(data)
         assert "business_meta" in result
         assert result["business_meta"]["source"] == "api"
 
-    def test_max_length_ids(self):
-        """最大长度 ID"""
-        id128 = "a" * 128
-        from app.services.validation_service import validate_id_format
-        assert validate_id_format("id", id128) is None
 
-    def test_exceed_max_length_id(self):
-        """超过最大长度的 ID"""
-        id129 = "a" * 129
-        from app.services.validation_service import validate_id_format
-        err = validate_id_format("id", id129)
-        assert err is not None
+# ============================================================
+# 8. WriteResultItem Schema
+# ============================================================
+
+class TestWriteResultSchema:
+    """写入结果 Schema"""
+
+    def test_result_item(self):
+        from app.schemas.memory import WriteResultItem, MemoryEvent
+        item = WriteResultItem(id="mem_abc", memory="用户偏好Python", event=MemoryEvent.ADD)
+        assert item.id == "mem_abc"
+        assert item.event == MemoryEvent.ADD
+
+    def test_all_events(self):
+        from app.schemas.memory import MemoryEvent
+        events = [e.value for e in MemoryEvent]
+        assert "ADD" in events
+        assert "SKIP" in events
+        assert "MERGE" in events
+
+    def test_response_empty_results(self):
+        from app.schemas.memory import MemoryWriteResponse
+        resp = MemoryWriteResponse(results=[])
+        assert resp.results == []

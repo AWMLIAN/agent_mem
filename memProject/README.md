@@ -248,53 +248,71 @@ A: 确认已打补丁 3（删除 `limit=10` 参数）。
 
 ---
 
-## 智能体接入与记忆数据写入
+## 角色A — 智能体接入与记忆数据写入（已完成 ✅）
 
+> 对齐文档：《核心业务逻辑拆解》《智能体接入与记忆数据写入后端功能任务分工》
+> 最近更新：对齐《核心改动》文档 + 《API接口文档-前端对接.md》
+
+### 核心改动点（v2）
+
+| 改动 | 说明 |
+|------|------|
+| **messages 数组为 Primary** | 前端传入 `messages: [{role, content}]` 多轮对话数组，后端逐条拆分落库 |
+| **results 返回格式** | `/memory/write` 返回 `results: [{id, memory, event: ADD/SKIP/MERGE}]`，联调期 Mock 规则抽取 |
+| **AUTH_ENABLED 开关** | 开发阶段 `AUTH_ENABLED=false` 跳过鉴权；生产阶段 `true` 强制 X-API-Key 校验 |
+| **Session/Task 真DB** | Session（创建/关闭）和 Task（创建/更新进展/查询进度）全部实现真实 DB 操作 |
 
 ### 数据流（写入链路）
 
 ```
 POST /api/v1/memory/write
+  │  Body: {user_id, scene_id?, task_id?, messages: [{role, content}]}
   │
-  ├─ 1. 鉴权 (app/api/deps.py)
-  │     X-API-Key → SHA256 → 查 t_agent → 验证 is_active
-  │     X-User-Id / X-Scene-Id / X-Session-Id 注入
+  ├─ 1. 鉴权 (deps.py)
+  │     开发阶段(AUTH_ENABLED=false) → 跳过，使用默认测试Agent
+  │     生产阶段(AUTH_ENABLED=true)  → X-API-Key → SHA256 → t_agent
   │
-  ├─ 2. Pydantic Schema 校验 (MemoryWriteRequest)
-  │     ID 标准化（去空格/小写） + 模式互斥（content vs messages）
+  ├─ 2. Schema 校验 (MemoryWriteRequest)
+  │     messages: [{role: user/assistant/system, content}], ID自动标准化
   │
-  ├─ 3. 数据校验管线 (validation_service.py)
-  │     必填字段 → 类型 → ID格式 → 内容长度
-  │     → 时间标准化(ISO 8601) → 元数据补全 → record_id 生成
+  ├─ 3. 逐条写入 t_interaction_record
+  │     processed=False, turn_index 标记轮次
   │
-  ├─ 4. 写入 t_interaction_record (PostgreSQL)
-  │     processed=False (标记待 LLM 抽取)
+  ├─ 4. Mock 记忆抽取 (联调期规则)
+  │     "我叫xxx"→ADD / "喜欢"→ADD / 问候→SKIP / system→SKIP
   │
-  ├─ 5. API 日志 (ApiLogMiddleware, fire-and-forget)
-  │     异步写入 t_api_log (trace_id, agent_id, api_path, elapsed_ms...)
-  │
-  └─ 6. 返回 200 + record_id
+  └─ 5. 返回 {"code":0, "data": {"results": [{id, memory, event}]}}
 ```
 
 ### 完成的功能模块
 
 | 模块 | 文件 | 说明 |
 |------|------|------|
-| **Schema 层** | `app/schemas/memory.py` | 文档标准格式：`interaction_type`/`role`/`content`/`business_meta`，Pydantic 层 ID 标准化 + 模式互斥校验 |
-| **校验管线** | `app/services/validation_service.py` | 7 步校验管线：必填→类型→ID格式→长度→时间标准化→ID规范化→元数据补全 |
-| **同步写入** | `app/api/v1/memory.py` → `/write` | 鉴权→校验→标准化→写库→返回 200 |
-| **异步写入** | `app/api/v1/memory.py` → `/async_write` | 鉴权→快速校验→MQ投递→202 Accepted（MQ不可用时降级同步写入） |
-| **API日志** | `app/middleware/api_log.py` | fire-and-forget 异步写 `t_api_log`，记录 8 个字段 |
-| **Agent CRUD** | `app/api/v1/agent.py` | 注册(只返回一次api_key明文，DB只存SHA256)、分页列表、查询、更新、停用、Key轮换 |
+| **Schema 层** | `app/schemas/memory.py` | `messages` 数组 Primary + `results[{id, memory, event}]` 响应 |
+| **校验管线** | `app/services/validation_service.py` | 7步校验管线：必填→类型→ID格式→长度→时间标准化→ID规范化→元数据补全 |
+| **同步写入** | `app/api/v1/memory.py` → `/write` | 逐条落库 + Mock抽取 → 返回 results |
+| **异步写入** | `app/api/v1/memory.py` → `/async_write` | 鉴权→投递MQ→返回 request_id（MQ不可用降级同步写入） |
+| **API日志** | `app/middleware/api_log.py` | fire-and-forget 写 `t_api_log` |
+| **鉴权开关** | `app/api/deps.py` + `app/middleware/auth.py` | `AUTH_ENABLED` 开发/生产双模式 |
+| **Agent CRUD** | `app/api/v1/agent.py` | 注册(api_key仅一次明文)、分页列表、查询、更新、停用、Key轮换 |
 | **Scene CRUD** | `app/api/v1/scene.py` | 创建、分页列表、查询、更新、停用 |
-| **多租户隔离** | `app/api/deps.py` | 停用Agent拒绝、scene权限校验、ID标准化、数据隔离验证 |
+| **Session CRUD** | `app/api/v1/session.py` | 创建、分页列表、查询、更新、关闭(触发压缩) |
+| **Task CRUD** | `app/api/v1/task.py` | 创建、分页列表、查询、更新进展、进展摘要(含关联记忆数)、完成 |
+| **统一响应** | `app/middleware/error_handler.py` | `{code, message, error_code, trace_id}` + INVALID_PARAM 错误码 |
+| **多租户隔离** | `app/api/deps.py` | 停用Agent拒绝、scene权限校验、ID标准化 |
 
 ### 测试覆盖
 
 ```bash
 pytest tests/test_role_a.py -v
 # 49 passed — 覆盖:
-#   必填校验(6) / 类型校验(6) / ID格式(5) / 时间标准化(6)
-#   ID规范化(4) / 元数据补全(2) / 一站式管线(4) / 安全工具(4)
-#   Schema层(5) / 异步Schema(2) / 边界值(5)
+#   Schema层(10) / Mock抽取(6) / 必填校验(5) / ID标准化(3)
+#   时间标准化(3) / 元数据(2) / 一站式管线(2) / 安全工具(4)
+#   统一响应(3) / AUTH开关(2) / 边界值(6) / WriteResult(3)
 ```
+
+### 角色B 待对接项
+
+- **MQ Producer/Consumer**：`_try_deliver_to_mq()` 当前返回 `False`（降级同步写入），需角色B实现
+- **正式期记忆抽取**：Mock 规则替换为下游"记忆生成+去重融合"模块的 RPC/MQ 回调
+- **统一错误码**：建议共同制定标准业务错误码（40001=Token失效，40002=必填字段缺失）
