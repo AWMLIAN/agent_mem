@@ -114,38 +114,39 @@ class ApiLogMiddleware(BaseHTTPMiddleware):
 
         # 计时
         start = time_module.perf_counter()
-        error_code: str | None = None
+        response_code = 500
+        error_code: str | None = "INTERNAL_ERROR"
+        response: Response | None = None
 
         try:
-            response: Response = await call_next(request)
+            response = await call_next(request)
+            response_code = response.status_code
+            error_code = None
+            # 从响应中提取错误码（如果存在）
+            if response_code >= 400:
+                error_code = _extract_error_code(response)
+            return response
         except Exception:
-            # 其他中间件或路由处理器抛出的异常会被 error_handler 捕获
-            # 这里重新抛出，由上层处理
+            # 记录异常并重新抛出
+            response_code = 500
+            error_code = "INTERNAL_ERROR"
             raise
         finally:
             elapsed_ms = round((time_module.perf_counter() - start) * 1000)
 
-        response_code = response.status_code
-
-        # 从响应中提取错误码（如果存在）
-        if response_code >= 400:
-            error_code = _extract_error_code(response)
-
-        # fire-and-forget 写入日志
-        asyncio.create_task(
-            _write_api_log(
-                trace_id=trace_id,
-                agent_id=agent_id,
-                api_path=path,
-                method=request.method,
-                request_params=request_params,
-                response_code=response_code,
-                error_code=error_code,
-                elapsed_ms=elapsed_ms,
+            # fire-and-forget 写入日志
+            asyncio.create_task(
+                _write_api_log(
+                    trace_id=trace_id,
+                    agent_id=agent_id,
+                    api_path=path,
+                    method=request.method,
+                    request_params=request_params,
+                    response_code=response_code,
+                    error_code=error_code,
+                    elapsed_ms=elapsed_ms,
+                )
             )
-        )
-
-        return response
 
 
 def _collect_request_params(request: Request) -> dict:

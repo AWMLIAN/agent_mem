@@ -21,7 +21,7 @@ from app.core.database import get_db
 from app.core.exceptions import NotFoundError
 from app.core.logger import get_logger
 from app.core.security import generate_session_id
-from app.models.base import Session
+from app.models.base import Session, Memory
 from app.schemas.common import ok
 from app.schemas.session import SessionCreateRequest, SessionUpdateRequest
 
@@ -183,7 +183,8 @@ async def session_close(
     触发动作：
     1. 更新 status → closed
     2. 记录 ended_at
-    3. 触发长对话压缩任务（角色B实现）
+    3. 统计关联记忆数
+    4. 触发长对话压缩任务（角色B实现）
     """
     result = await db.execute(
         select(Session).where(Session.session_id == session_id.strip().lower())
@@ -194,14 +195,28 @@ async def session_close(
 
     session.status = "closed"
     session.ended_at = datetime.now(timezone.utc)
+
+    # 统计该会话产生的记忆数
+    mem_count_result = await db.execute(
+        select(func.count()).where(
+            Memory.session_id == session_id.strip().lower(),
+            Memory.status == "active",
+        )
+    )
+    memory_count = mem_count_result.scalar() or 0
+
     await db.commit()
 
-    logger.info(f"会话关闭: session_id={session_id}, messages={session.message_count}")
+    logger.info(
+        f"会话关闭: session_id={session_id}, "
+        f"messages={session.message_count}, memories={memory_count}"
+    )
 
     return ok({
         "session_id": session_id,
         "status": "closed",
         "message_count": session.message_count or 0,
+        "memory_count": memory_count,
         "ended_at": session.ended_at.isoformat(),
-        "summary": "会话已关闭",
+        "summary": f"会话已关闭，产生 {memory_count} 条记忆",
     }, "关闭成功")

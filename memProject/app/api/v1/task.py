@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_agent, get_current_user_id
 from app.core.database import get_db
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, ConflictError
 from app.core.logger import get_logger
 from app.core.security import generate_task_id
 from app.models.base import Task, Memory
@@ -28,6 +28,26 @@ from app.schemas.task import TaskCreateRequest, TaskUpdateRequest
 
 logger = get_logger("task_api")
 router = APIRouter()
+
+# 合法状态转换规则
+VALID_TRANSITIONS: dict[str, set[str]] = {
+    "pending": {"in_progress", "completed", "cancelled"},
+    "in_progress": {"completed", "cancelled", "pending"},
+    "completed": {"in_progress", "cancelled"},  # 允许重新打开已完成任务
+    "cancelled": {"pending"},  # 取消后可重新激活
+}
+
+
+def _validate_status_transition(current: str, new: str) -> None:
+    """校验状态转换合法性"""
+    if current == new:
+        return
+    allowed = VALID_TRANSITIONS.get(current, set())
+    if new not in allowed:
+        raise ConflictError(
+            f"任务状态不能从 '{current}' 直接转为 '{new}'，"
+            f"允许的转换: {', '.join(sorted(allowed))}"
+        )
 
 
 @router.post("", summary="创建任务", status_code=201)
@@ -178,6 +198,7 @@ async def task_update(
     if body.goal is not None:
         task.goal = body.goal
     if body.status is not None:
+        _validate_status_transition(task.status, body.status)
         task.status = body.status
         if body.status == "completed":
             task.ended_at = datetime.now(timezone.utc)

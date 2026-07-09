@@ -71,17 +71,19 @@ async def get_current_agent(
     # ================================================================
     if x_api_key:
         key_hash = hash_api_key(x_api_key)
+        # 先查是否存在（不论激活状态）
         result = await db.execute(
-            select(Agent).where(
-                Agent.api_key_hash == key_hash,
-                Agent.is_active == True,
-            )
+            select(Agent).where(Agent.api_key_hash == key_hash)
         )
         agent = result.scalar_one_or_none()
 
         if not agent:
             logger.warning(f"无效的 API Key 尝试: prefix={x_api_key[:8]}...")
             raise AuthenticationError("无效的 API Key")
+
+        if not agent.is_active:
+            logger.warning(f"已停用 Agent 尝试访问: agent_id={agent.agent_id}")
+            raise AuthenticationError("该智能体已被停用，请联系管理员")
 
         request.state.agent_id = agent.agent_id
         request.state.scene_id = agent.scene_id
@@ -103,10 +105,12 @@ async def get_current_agent(
                 Agent.is_active == True,
             )
         )
-        if not result.scalar_one_or_none():
+        agent = result.scalar_one_or_none()
+        if not agent:
             raise AuthenticationError("Token 对应的智能体已停用或不存在")
 
         request.state.agent_id = agent_id
+        request.state.scene_id = agent.scene_id  # FIX: JWT路径也注入scene_id
         request.state.auth_bypassed = False
         logger.debug(f"Agent 鉴权通过 (JWT): agent_id={agent_id}")
         return agent_id
