@@ -16,6 +16,9 @@ from app.services.memory_service import (
     gen_memory_id,
     gen_record_id,
     gen_request_id,
+    get_user_profile,
+    get_session_context,
+    get_task_view,
 )
 
 __all__ = [
@@ -36,4 +39,7 @@ __all__ = [
     "gen_memory_id",
     "gen_record_id",
     "gen_request_id",
+    "get_user_profile",
+    "get_session_context",
+    "get_task_view",
 ]

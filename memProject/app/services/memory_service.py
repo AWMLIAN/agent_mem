@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select, func, update as sa_update, delete as sa_delete
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, MemoryWriteError
@@ -59,6 +59,100 @@ async def get_memory_by_id(db: AsyncSession, memory_id: str) -> Optional[Memory]
 
 
 async def create_memory(db: AsyncSession, data: dict) -> Memory:
+    """类型感知的记忆创建 — 根据 memory_type 走不同的预处理规则。"""
+    memory_type = data.get("memory_type", "fact")
+
+    if memory_type == "preference":
+        return await _create_preference(db, data)
+    elif memory_type == "task":
+        return await _create_task_memory(db, data)
+    else:
+        return await _create_fact(db, data)
+
+
+async def _create_preference(db: AsyncSession, data: dict) -> Memory:
+    """偏好管理：新偏好替换旧偏好，旧标记 pending_update。"""
+    user_id = data.get("user_id")
+    if user_id:
+        old = await search_local(db, {
+            "user_id": user_id, "memory_types": ["preference"], "status": "active",
+        })
+        for m in old:
+            m.status = "pending_update"
+            m.updated_at = _now()
+        if old:
+            logger.info(f"用户 {user_id} 旧偏好 {len(old)} 条标记为 pending_update")
+
+    return await _insert_memory(db, data)
+
+
+async def _create_fact(db: AsyncSession, data: dict) -> Memory:
+    """事实管理：简单内容去重 + 冲突检测。"""
+    content = data.get("content", "")
+    user_id = data.get("user_id")
+
+    if user_id and len(content) > 5:
+        existing = await search_local(db, {
+            "user_id": user_id, "memory_types": ["fact"], "status": "active",
+        })
+        for m in existing:
+            overlap = _content_overlap(content, m.content or "")
+            if overlap > 0.9:
+                logger.info(f"事实去重：与 {m.memory_id} 相似度 {overlap:.2f}，跳过")
+                m.use_count = (m.use_count or 0) + 1
+                return m
+            elif overlap >= 0.5:
+                data["status"] = "conflict"
+                logger.info(f"事实冲突标记：与 {m.memory_id} 相似度 {overlap:.2f}")
+
+    return await _insert_memory(db, data)
+
+
+# 任务目标关键词 — 命中则视为"目标/诉求"类记忆，走新旧更替逻辑
+_TASK_GOAL_KEYWORDS = {"目标", "目的", "诉求", "任务", "需求", "要做", "实现", "完成目标", "交付", "goal", "objective", "task"}
+
+
+def _is_task_goal(content: str, key_points: list) -> bool:
+    text = content + " " + " ".join(key_points or [])
+    return any(kw in text for kw in _TASK_GOAL_KEYWORDS)
+
+
+async def _create_task_memory(db: AsyncSession, data: dict) -> Memory:
+    """任务记忆管理 — 区分目标与进展。"""
+    task_id = data.get("task_id")
+    content = data.get("content", "")
+    key_points = data.get("key_points", [])
+
+    if task_id and _is_task_goal(content, key_points):
+        # 目标类：新目标替换旧目标，旧标记 pending_update
+        existing = await search_local(db, {
+            "task_id": task_id, "memory_types": ["task"], "status": "active",
+        })
+        old_goals = [m for m in existing if _is_task_goal(m.content or "", m.key_points or [])]
+        for m in old_goals:
+            m.status = "pending_update"
+            m.updated_at = _now()
+        if old_goals:
+            logger.info(f"任务 {task_id} 旧目标 {len(old_goals)} 条标记为 pending_update")
+    # 进展类：直接追加，保留历史链
+
+    return await _insert_memory(db, data)
+
+
+def _content_overlap(a: str, b: str) -> float:
+    """词级相似度计算 — 基于关键词重合而非字符重合"""
+    if not a or not b:
+        return 0.0
+    import re
+    words_a = set(re.findall(r'[一-鿿]+|[a-zA-Z]+', a.lower()))
+    words_b = set(re.findall(r'[一-鿿]+|[a-zA-Z]+', b.lower()))
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / min(len(words_a), len(words_b))
+
+
+async def _insert_memory(db: AsyncSession, data: dict) -> Memory:
+    """纯插入，不做任何类型逻辑。"""
     memory = Memory(
         id=uuid.uuid4().hex,
         memory_id=data.get("memory_id", gen_memory_id()),
@@ -231,6 +325,67 @@ async def build_context_query(db: AsyncSession, filters: dict) -> list[Memory]:
     stmt = stmt.order_by(Memory.importance.desc())
     result = await db.execute(stmt)
     return list(result.scalars().all())
+
+
+# ============================================================
+# 多层记忆聚合 — 用户/会话/任务三层结构化视图
+# ============================================================
+
+
+async def get_user_profile(db: AsyncSession, user_id: str) -> dict:
+    """用户画像：聚合用户跨会话的偏好和事实，供 LLM 注入 prompt。"""
+    all_memories = await search_local(db, {"user_id": user_id, "status": "active"})
+
+    profile = {
+        "user_id": user_id,
+        "preferences": [],
+        "facts": [],
+    }
+    for m in all_memories:
+        if m.memory_type == "preference":
+            profile["preferences"].append(m.content)
+        elif m.memory_type == "fact":
+            profile["facts"].append(m.content)
+    return profile
+
+
+async def get_session_context(db: AsyncSession, session_id: str) -> dict:
+    """会话上下文：会话内所有记忆按类型分组 + 关键内容。"""
+    all_memories = await search_local(db, {"session_id": session_id, "status": "active"})
+
+    ctx: dict = {"session_id": session_id, "by_type": {}, "key_items": []}
+    for m in all_memories:
+        ctx["by_type"].setdefault(m.memory_type, []).append({
+            "memory_id": m.memory_id, "content": m.content, "importance": m.importance,
+        })
+        if m.importance >= 0.7:
+            ctx["key_items"].append({
+                "memory_id": m.memory_id, "content": m.content, "memory_type": m.memory_type,
+            })
+    return ctx
+
+
+async def get_task_view(db: AsyncSession, task_id: str) -> dict:
+    """任务视图：当前目标 + 进展时间线。"""
+    all_memories = await search_local(db, {
+        "task_id": task_id, "memory_types": ["task"],
+    })
+    all_memories.sort(key=lambda m: m.created_at or datetime.min)
+
+    view: dict = {
+        "task_id": task_id,
+        "current_goal": None,
+        "progress_timeline": [],
+    }
+    for m in all_memories:
+        if m.status == "active" and _is_task_goal(m.content or "", m.key_points or []):
+            view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
+        view["progress_timeline"].append({
+            "memory_id": m.memory_id, "content": m.content,
+            "status": m.status, "created_at": m.created_at.isoformat() if m.created_at else None,
+        })
+
+    return view
 
 
 # ============================================================

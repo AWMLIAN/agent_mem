@@ -50,6 +50,7 @@ from app.services.memory_service import (
     update_memory_fields,
     soft_delete_memory,
     build_context_query,
+    list_memories_filtered,
     get_stats,
     get_memory_relations,
 )
@@ -303,20 +304,35 @@ async def _fallback_sync_write(
 # 检索 — 对齐前端对接文档 一.2 节
 # ============================================================
 
-@router.post("/search", summary="检索记忆")
-async def memory_search(body: MemorySearchRequest, db: AsyncSession = Depends(get_db)):
-    """检索历史记忆（语义 + BM25 + 元数据三路融合）"""
-    try:
-        result = await mcp_client.search_memory(query=body.query, user_id=body.user_id)
-        return ok(result)
-    except Exception:
-        # MCP 不可用时返回空结果（降级）
-        return ok({
-            "query": body.query,
-            "results": [],
-            "total_candidates": 0,
-            "elapsed_ms": 0,
-        })
+@router.post("/search", summary="检索记忆（本地多维过滤）")
+async def memory_search(
+    body: MemorySearchRequest,
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    """多维过滤检索 — 用户/场景/会话/任务/类型/时间/状态任意组合"""
+    from app.services.memory_service import search_local as local_search
+    filters = {
+        "user_id": body.user_id,
+        "agent_id": body.agent_id,
+        "scene_id": body.scene_id,
+        "session_id": body.session_id,
+        "task_id": body.task_id,
+        "memory_types": body.memory_types,
+        "time_start": body.time_start,
+        "time_end": body.time_end,
+        "include_inactive": body.include_inactive,
+    }
+    results = await local_search(db, filters)
+    items = [{
+        "memory_id": m.memory_id, "content": m.content, "summary": m.summary,
+        "memory_type": m.memory_type, "status": m.status,
+        "importance": m.importance, "confidence": m.confidence,
+        "tags": m.tags, "source_type": m.source_type,
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+        "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+    } for m in results[: body.top_k]]
+    return ok({"query": body.query, "results": items, "total": len(items)})
 
 
 @router.post("/context", summary="Prompt 上下文片段")
@@ -374,6 +390,34 @@ async def memory_delete(
     return ok({"memory_id": memory_id, "deleted": True, "previous_status": previous_status})
 
 
+@router.get("/list", summary="多维度过滤查询")
+async def memory_list_filtered(
+    user_id: str = Query(...),
+    scene_id: str = Query(None),
+    session_id: str = Query(None),
+    task_id: str = Query(None),
+    memory_type: str = Query(None),
+    status: str = Query(None),
+    time_start: str = Query(None),
+    time_end: str = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    from datetime import datetime as dt
+    filters = {"user_id": user_id}
+    if scene_id: filters["scene_id"] = scene_id
+    if session_id: filters["session_id"] = session_id
+    if task_id: filters["task_id"] = task_id
+    if memory_type: filters["memory_types"] = [memory_type]
+    if status: filters["status"] = status
+    if time_start: filters["time_start"] = dt.fromisoformat(time_start)
+    if time_end: filters["time_end"] = dt.fromisoformat(time_end)
+    items, total = await list_memories_filtered(db, filters, page, page_size)
+    return ok({"items": [_memory_to_dict(m) for m in items], "total": total, "page": page, "page_size": page_size})
+
+
 @router.get("/stats", summary="记忆统计")
 async def memory_stats(
     db: AsyncSession = Depends(get_db),
@@ -428,7 +472,17 @@ async def memory_relations(
 # MCP 工具直通接口 — 测试用
 # ============================================================
 
-@router.post("/list", summary="列出全部记忆")
+def _memory_to_dict(m) -> dict:
+    return {"memory_id":m.memory_id,"content":m.content,"summary":m.summary,
+            "key_points":m.key_points,"memory_type":m.memory_type,"status":m.status,
+            "importance":m.importance,"confidence":m.confidence,"tags":m.tags,
+            "user_id":m.user_id,"agent_id":m.agent_id,"scene_id":m.scene_id,
+            "session_id":m.session_id,"task_id":m.task_id,"version":m.version,
+            "created_at":m.created_at.isoformat() if m.created_at else None,
+            "updated_at":m.updated_at.isoformat() if m.updated_at else None}
+
+
+@router.post("/list", summary="列出全部记忆（MCP）")
 async def memory_list(user_id: str = Query(...)):
     result = await mcp_client.list_memories(user_id=user_id)
     return ok(result)

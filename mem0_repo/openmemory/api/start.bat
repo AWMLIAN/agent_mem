@@ -1,5 +1,5 @@
 @echo off
-cd /d C:\Users\lenovo\Desktop\claudecode\mem0_repo\openmemory\api
+cd /d D:\ALL_APPLICATION\VSCODE\agent_mem_clone\mem0_repo\openmemory\api
 set LLM_PROVIDER=openai
 set LLM_MODEL=deepseek-chat
 set LLM_API_KEY=sk-49412e1232c54ba8b8a40c854b3edf21

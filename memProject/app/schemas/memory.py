@@ -136,15 +136,17 @@ class MemorySearchRequest(BaseModel):
     """混合检索请求"""
     query: str = Field(..., description="检索查询文本")
     user_id: str = Field(..., description="用户标识")
+    agent_id: Optional[str] = Field(None)
     scene_id: Optional[str] = Field(None)
-    task_id: Optional[str] = Field(None)
     session_id: Optional[str] = Field(None)
+    task_id: Optional[str] = Field(None)
     memory_types: Optional[list[str]] = Field(None, description="筛选类型: preference/fact/task/decision/constraint")
     top_k: int = Field(default=10, ge=1, le=50)
     time_start: Optional[datetime] = Field(None)
     time_end: Optional[datetime] = Field(None)
-    rerank: bool = Field(default=False, description="是否启用二次排序")
+    include_inactive: bool = Field(default=False)
     include_scores: bool = Field(default=True)
+    rerank: bool = Field(default=False, description="是否启用二次排序")
 
 
 class MemoryResultItem(BaseModel):
@@ -176,9 +178,10 @@ class ContextRequest(BaseModel):
     """上下文返回请求"""
     query: str = Field(..., description="当前用户问题")
     user_id: str = Field(..., description="用户标识")
+    agent_id: Optional[str] = Field(None)
     scene_id: Optional[str] = Field(None)
-    task_id: Optional[str] = Field(None)
     session_id: Optional[str] = Field(None)
+    task_id: Optional[str] = Field(None)
     max_tokens: int = Field(default=3000)
     group_by_type: bool = Field(default=True)
     include_preferences: bool = Field(default=True)
