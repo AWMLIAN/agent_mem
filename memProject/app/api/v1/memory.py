@@ -24,9 +24,11 @@ from app.api.deps import (
     get_current_task_id,
 )
 from app.core.database import get_db
+from app.core.exceptions import ValidationError
 from app.core.logger import get_logger
 from app.mcp_client import mcp_client
 from app.models.base import InteractionRecord
+from app.services.validation_service import validate_id_format, normalize_id
 from app.schemas.common import ok
 from app.schemas.memory import (
     MemoryWriteRequest,
@@ -173,9 +175,15 @@ async def memory_write(
     start = time_module.perf_counter()
 
     # 合并 ID 来源（Header > Body）
-    effective_user_id = (user_id_header or body.user_id).strip().lower()
+    effective_user_id = normalize_id(user_id_header or body.user_id)
     effective_scene_id = scene_id or body.scene_id
     effective_session_id = body.session_id or f"sess_{uuid4().hex[:12]}"
+
+    # --- 业务级校验（Pydantic 之上，补充 ID 格式等） ---
+    if effective_user_id:
+        err = validate_id_format("user_id", effective_user_id)
+        if err:
+            raise ValidationError(message=err)
 
     # --- 写入原始交互记录（逐条落库，标记 processed=False） ---
     from datetime import datetime, timezone
