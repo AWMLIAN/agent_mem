@@ -84,9 +84,9 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         trace_id = _get_trace_id(request)
-        logger.exception(
-            f"[{trace_id}] Unhandled 500: {type(exc).__name__}: {exc}",
-            extra={"trace_id": trace_id, "path": request.url.path},
+        logger.opt(exception=True).error(
+            "[{}] Unhandled 500: {}: {}",
+            trace_id, type(exc).__name__, exc,
         )
         return JSONResponse(
             status_code=500,

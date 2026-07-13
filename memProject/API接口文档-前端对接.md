@@ -280,4 +280,64 @@ POST /api/v1/memory/delete-all?user_id=user_001
 ```
 
 
+---
+
+## 六、实现状态说明（2026-07-13 更新）
+
+### 后端处理管线
+
+`POST /memory/write` 已从 Mock 替换为**真实记忆生成流水线**：
+
+```
+messages 数组 → 拼接对话文本 → MemoryPipeline
+  ├── Phase 1: MemoryExtractor   (三路并行 LLM 抽取: 关键事实 + 任务状态 + 历史决策)
+  ├── Phase 2: MemoryGenerator   (LLM 生成结构化 MemoryCandidate)
+  ├── Phase 3: DedupService      (Qdrant 向量 + Jaccard 关键词 + 标识检查 → 综合决策)
+  └── Phase 4: Store             (PostgreSQL + Qdrant 双写)
+```
+
+**关键技术栈:**
+- LLM: DeepSeek (`deepseek-chat`) — 直连 API
+- Embedding: SiliconFlow (`BGE-M3`, 1024维) — 直连 API
+- 向量库: Qdrant (collection: `agent_mem_generation`)
+- 数据库: PostgreSQL (`t_memory` 表)
+
+### 端点实现状态
+
+| 端点 | 方法 | 状态 | 说明 |
+|------|------|------|------|
+| `/memory/write` | POST | ✅ 已实现 | 真实 Pipeline：extract→generate→dedup→store |
+| `/memory/search` | POST | ✅ 已实现 | Qdrant 语义搜索 + PostgreSQL 元数据过滤 |
+| `/memory/list` | POST | ✅ 已实现 | PostgreSQL 分页查询，空时降级 MCP |
+| `/memory/delete-all` | POST | ✅ 已实现 | PostgreSQL + Qdrant + MCP 三清 |
+| `/memory/context` | POST | ✅ 已实现 | 检索 + 按类型分组格式化为 Prompt |
+| `/memory/update` | PUT | ✅ 已实现 | 部分字段更新 + 向量重算 |
+| `/memory/delete` | DELETE | ✅ 已实现 | 软删除 + Qdrant 向量移除 |
+| `/memory/async_write` | POST | ⚠️ 占位 | 即刻返回 request_id，MQ 未实现（降级同步） |
+| `/memory/generate` | POST | ✅ 已实现 | 直接输入文本→记忆（设计用于调试/批量导入） |
+| `/memory/generate/batch` | POST | ✅ 已实现 | 批量生成，最多 50 条 |
+| `/memory/generate/async` | POST | ⚠️ 占位 | 异步任务需 Celery/Kafka |
+
+### 去重决策矩阵
+
+`/memory/write` 返回的 `event` 字段映射：
+
+| Pipeline Action | 前端 event | 含义 |
+|-----------------|-----------|------|
+| `keep_new` | `ADD` | 新记忆已创建 |
+| `merge` | `MERGE` | 合并到已有记忆 |
+| `update_existing` | `ADD` | 更新已有记忆（视为新增信息） |
+| `discard` | `SKIP` | 高度重复，跳过 |
+
+### 延迟预估
+
+| 操作 | 预估延迟 | 说明 |
+|------|---------|------|
+| `/memory/write` | 5-15s | 4 次 LLM 调用（3 路并行抽取 + 1 次生成） |
+| `/memory/search` | 200-500ms | Embedding 计算 + Qdrant 检索 + DB 查询 |
+| `/memory/list` | 50-200ms | 纯 DB 分页查询 |
+| `/memory/delete-all` | 100-500ms | DB 批量删除 + Qdrant 向量清理 |
+| `/memory/context` | 300-800ms | 等同于 search + 格式化 |
+
+> **建议**: 生产环境中将 `/memory/write` 替换为 `/memory/async_write`，前端先展示对话，后台异步生成记忆。下一次对话前检索即可命中新记忆。
 

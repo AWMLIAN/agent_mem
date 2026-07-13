@@ -4,6 +4,7 @@ from app.services.validation_service import validate_and_standardize, Validation
 from app.services.llm_client import llm_client, LLMClient
 from app.services.embedding_client import embedding_client, EmbeddingClient
 from app.services.memory_pipeline import memory_pipeline, MemoryPipeline
+from app.services.memory_store import memory_store, MemoryStore
 
 __all__ = [
     "mem0_client",
@@ -16,4 +17,6 @@ __all__ = [
     "EmbeddingClient",
     "memory_pipeline",
     "MemoryPipeline",
+    "memory_store",
+    "MemoryStore",
 ]
