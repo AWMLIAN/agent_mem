@@ -28,7 +28,11 @@ from app.core.exceptions import ValidationError
 from app.core.logger import get_logger
 from app.mcp_client import mcp_client
 from app.models.base import InteractionRecord
-from app.services.validation_service import validate_id_format, normalize_id
+from app.services.validation_service import (
+    validate_id_format,
+    normalize_id,
+    validate_write_request_by_type,
+)
 from app.schemas.common import ok
 from app.schemas.memory import (
     MemoryWriteRequest,
@@ -154,54 +158,84 @@ async def memory_write(
     scene_id: str | None = Depends(get_current_scene_id),
 ):
     """
-    同步写入对话记忆。
+    同步写入记忆数据，支持三种数据类型：
+
+    - dialogue (对话记录): messages 数组逐条落库，每轮标记 turn_index
+    - session (历史会话): 导入历史会话内容、时间、来源信息
+    - task_process (任务过程): 写入任务目标、进展、执行结果
 
     处理管线：
     1. 鉴权（开发阶段跳过）
-    2. Pydantic 校验（messages 数组格式）
-    3. 逐条写入 t_interaction_record（原始记录）
+    2. Pydantic 校验（按 interaction_type 差异化校验）
+    3. 写入 t_interaction_record（原始记录）
     4. Mock 记忆抽取 → 生成 results
     5. 返回 {"code": 0, "data": {"results": [...]}}
     """
     start = time_module.perf_counter()
+    itype = body.interaction_type
 
     # 合并 ID 来源（Header > Body）
     effective_user_id = normalize_id(user_id_header or body.user_id)
     effective_scene_id = scene_id or body.scene_id
     effective_session_id = body.session_id or f"sess_{uuid4().hex[:12]}"
 
-    # --- 业务级校验（Pydantic 之上，补充 ID 格式等） ---
+    # --- 业务级校验（Pydantic 之上，补充 ID 格式和类型感知校验） ---
     if effective_user_id:
         err = validate_id_format("user_id", effective_user_id)
         if err:
             raise ValidationError(message=err)
 
-    # --- 写入原始交互记录（逐条落库，标记 processed=False） ---
+    # 类型感知校验：确保每种 interaction_type 有足够的输入数据
+    type_validation = validate_write_request_by_type(
+        interaction_type=itype,
+        messages=body.messages,
+        session_summary=body.session_summary,
+        session_time=body.session_time,
+        task_goal=body.task_goal,
+        task_progress=body.task_progress,
+        task_result=body.task_result,
+    )
+    type_validation.raise_if_invalid()
+
+    # --- 写入原始交互记录 ---
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
-    for i, msg in enumerate(body.messages):
-        record = InteractionRecord(
-            record_id=f"rec_{uuid4().hex[:24]}",
-            user_id=effective_user_id,
-            agent_id=agent_id,
-            scene_id=effective_scene_id,
-            session_id=effective_session_id,
-            task_id=body.task_id,
-            turn_index=i,
-            role=msg.role,
-            content=msg.content,
-            content_type="text",
-            processed=False,
-            recorded_at=now,
-            extra_meta=body.metadata or {},
-        )
-        db.add(record)
+    if itype == "dialogue":
+        _write_dialogue_records(body, db, effective_user_id, agent_id,
+                                effective_scene_id, effective_session_id, now)
+    elif itype == "session":
+        _write_session_records(body, db, effective_user_id, agent_id,
+                               effective_scene_id, effective_session_id, now)
+    elif itype == "task_process":
+        _write_task_process_records(body, db, effective_user_id, agent_id,
+                                    effective_scene_id, effective_session_id, now)
 
     await db.commit()
 
     # --- Mock 记忆抽取（联调期规则，正式期替换为下游 RPC 调用） ---
-    mock_results = _mock_extract_memories(body.messages, effective_user_id)
+    content_for_extract = list(body.messages)  # 对话消息
+    if itype == "session" and body.session_summary:
+        # 为 session 类型创建虚拟消息用于抽取
+        from app.schemas.memory import MessageItem
+        content_for_extract.append(
+            MessageItem(role="user", content=f"[历史会话] {body.session_summary[:500]}")
+        )
+    elif itype == "task_process":
+        from app.schemas.memory import MessageItem
+        parts = []
+        if body.task_goal:
+            parts.append(f"任务目标: {body.task_goal}")
+        if body.task_progress:
+            parts.append(f"任务进展: {body.task_progress}")
+        if body.task_result:
+            parts.append(f"执行结果: {body.task_result}")
+        if parts:
+            content_for_extract.append(
+                MessageItem(role="user", content="; ".join(parts)[:500])
+            )
+
+    mock_results = _mock_extract_memories(content_for_extract, effective_user_id)
 
     results = [
         WriteResultItem(
@@ -214,12 +248,144 @@ async def memory_write(
 
     elapsed = round((time_module.perf_counter() - start) * 1000, 2)
     logger.info(
-        f"同步写入完成: user_id={effective_user_id}, "
+        f"同步写入完成: type={itype}, user_id={effective_user_id}, "
         f"messages={len(body.messages)}, results={len(results)}, "
         f"elapsed={elapsed}ms"
     )
 
     return ok(MemoryWriteResponse(results=results).model_dump())
+
+
+def _write_dialogue_records(
+    body: MemoryWriteRequest, db, user_id: str, agent_id: str,
+    scene_id: str | None, session_id: str, now
+) -> None:
+    """写入对话记录：每条消息一行，标记 turn_index"""
+    for i, msg in enumerate(body.messages):
+        record = InteractionRecord(
+            record_id=f"rec_{uuid4().hex[:24]}",
+            user_id=user_id,
+            agent_id=agent_id,
+            scene_id=scene_id,
+            session_id=session_id,
+            task_id=body.task_id,
+            interaction_type="dialogue",
+            turn_index=i,
+            role=msg.role,
+            content=msg.content,
+            content_type="text",
+            processed=False,
+            recorded_at=now,
+            extra_meta=body.metadata or {},
+        )
+        db.add(record)
+
+
+def _write_session_records(
+    body: MemoryWriteRequest, db, user_id: str, agent_id: str,
+    scene_id: str | None, session_id: str, now
+) -> None:
+    """写入历史会话：对话消息 + 会话元信息（时间、来源）"""
+    session_meta = dict(body.metadata or {})
+    if body.session_time:
+        session_meta["session_time"] = body.session_time
+    if body.session_source:
+        session_meta["session_source"] = body.session_source
+
+    # 逐条写入对话消息（如果有）
+    for i, msg in enumerate(body.messages):
+        record = InteractionRecord(
+            record_id=f"rec_{uuid4().hex[:24]}",
+            user_id=user_id,
+            agent_id=agent_id,
+            scene_id=scene_id,
+            session_id=session_id,
+            task_id=body.task_id,
+            interaction_type="session",
+            turn_index=i,
+            role=msg.role,
+            content=msg.content,
+            content_type="text",
+            processed=False,
+            recorded_at=now,
+            extra_meta=session_meta,
+        )
+        db.add(record)
+
+    # 写入会话摘要（如果有）
+    if body.session_summary:
+        summary_record = InteractionRecord(
+            record_id=f"rec_{uuid4().hex[:24]}",
+            user_id=user_id,
+            agent_id=agent_id,
+            scene_id=scene_id,
+            session_id=session_id,
+            task_id=body.task_id,
+            interaction_type="session",
+            turn_index=len(body.messages),
+            role="session_summary",
+            content=body.session_summary,
+            content_type="session_summary",
+            processed=False,
+            recorded_at=now,
+            extra_meta=session_meta,
+        )
+        db.add(summary_record)
+
+
+def _write_task_process_records(
+    body: MemoryWriteRequest, db, user_id: str, agent_id: str,
+    scene_id: str | None, session_id: str, now
+) -> None:
+    """写入任务过程：对话消息 + 任务目标/进展/结果"""
+    task_meta = dict(body.metadata or {})
+
+    # 逐条写入对话消息（如果有）
+    for i, msg in enumerate(body.messages):
+        record = InteractionRecord(
+            record_id=f"rec_{uuid4().hex[:24]}",
+            user_id=user_id,
+            agent_id=agent_id,
+            scene_id=scene_id,
+            session_id=session_id,
+            task_id=body.task_id,
+            interaction_type="task_process",
+            turn_index=i,
+            role=msg.role,
+            content=msg.content,
+            content_type="text",
+            processed=False,
+            recorded_at=now,
+            extra_meta=task_meta,
+        )
+        db.add(record)
+
+    # 写入任务目标/进展/结果
+    turn_offset = len(body.messages)
+    task_fields = [
+        ("task_goal", body.task_goal),
+        ("task_progress", body.task_progress),
+        ("task_result", body.task_result),
+    ]
+    for j, (role_name, content) in enumerate(task_fields):
+        if content:
+            record = InteractionRecord(
+                record_id=f"rec_{uuid4().hex[:24]}",
+                user_id=user_id,
+                agent_id=agent_id,
+                scene_id=scene_id,
+                session_id=session_id,
+                task_id=body.task_id,
+                interaction_type="task_process",
+                turn_index=turn_offset + j,
+                role=role_name,
+                content=content,
+                content_type="task_process",
+                processed=False,
+                recorded_at=now,
+                extra_meta=task_meta,
+            )
+            db.add(record)
 
 
 # ============================================================
@@ -270,7 +436,18 @@ async def _fallback_sync_write(
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
+    itype = body.interaction_type
+    extra_meta = dict(body.metadata or {})
+
+    # 补全类型专用元数据
+    if itype == "session":
+        if body.session_time:
+            extra_meta["session_time"] = body.session_time
+        if body.session_source:
+            extra_meta["session_source"] = body.session_source
+
     async with async_session_factory() as session:
+        # 写入对话消息
         for i, msg in enumerate(body.messages):
             record = InteractionRecord(
                 record_id=f"rec_{uuid4().hex[:24]}",
@@ -279,14 +456,62 @@ async def _fallback_sync_write(
                 scene_id=body.scene_id,
                 session_id=body.session_id or f"sess_{uuid4().hex[:12]}",
                 task_id=body.task_id,
+                interaction_type=itype,
                 turn_index=i,
                 role=msg.role,
                 content=msg.content,
                 processed=False,
                 recorded_at=now,
-                extra_meta=body.metadata or {},
+                extra_meta=extra_meta,
             )
             session.add(record)
+
+        # session 类型：写入摘要
+        if itype == "session" and body.session_summary:
+            session.add(InteractionRecord(
+                record_id=f"rec_{uuid4().hex[:24]}",
+                user_id=user_id.strip().lower(),
+                agent_id=agent_id,
+                scene_id=body.scene_id,
+                session_id=body.session_id or f"sess_{uuid4().hex[:12]}",
+                task_id=body.task_id,
+                interaction_type=itype,
+                turn_index=len(body.messages),
+                role="session_summary",
+                content=body.session_summary,
+                content_type="session_summary",
+                processed=False,
+                recorded_at=now,
+                extra_meta=extra_meta,
+            ))
+
+        # task_process 类型：写入目标/进展/结果
+        if itype == "task_process":
+            turn_offset = len(body.messages)
+            task_fields = [
+                ("task_goal", body.task_goal),
+                ("task_progress", body.task_progress),
+                ("task_result", body.task_result),
+            ]
+            for j, (role_name, content) in enumerate(task_fields):
+                if content:
+                    session.add(InteractionRecord(
+                        record_id=f"rec_{uuid4().hex[:24]}",
+                        user_id=user_id.strip().lower(),
+                        agent_id=agent_id,
+                        scene_id=body.scene_id,
+                        session_id=body.session_id or f"sess_{uuid4().hex[:12]}",
+                        task_id=body.task_id,
+                        interaction_type=itype,
+                        turn_index=turn_offset + j,
+                        role=role_name,
+                        content=content,
+                        content_type="task_process",
+                        processed=False,
+                        recorded_at=now,
+                        extra_meta=extra_meta,
+                    ))
+
         await session.commit()
 
 

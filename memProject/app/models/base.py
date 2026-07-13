@@ -128,6 +128,7 @@ class InteractionRecord(Base):
     scene_id = Column(String(128), nullable=True, index=True)
     session_id = Column(String(128), nullable=False, index=True)
     task_id = Column(String(128), nullable=True, index=True)
+    interaction_type = Column(String(32), default="dialogue", index=True)
     turn_index = Column(Integer, default=0)
     role = Column(String(32), nullable=False)
     content = Column(Text, nullable=False)
@@ -140,6 +141,7 @@ class InteractionRecord(Base):
         Index("idx_interaction_session_turn", "session_id", "turn_index"),
         Index("idx_interaction_processed", "processed", "recorded_at"),
         Index("idx_interaction_user_time", "user_id", "recorded_at"),
+        Index("idx_interaction_type_user", "interaction_type", "user_id"),
     )
 
 

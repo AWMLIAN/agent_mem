@@ -42,14 +42,40 @@ class MemoryWriteRequest(BaseModel):
     """
     同步写入请求 — 对齐前端对接文档 一.1 节。
 
-    messages 数组为 Primary 格式，支持多轮对话批量写入。
+    支持三种数据类型（通过 interaction_type 区分）：
+    - dialogue:     当前对话记录，messages 数组为 Primary 格式
+    - session:      历史会话数据，含会话时间/来源/摘要
+    - task_process: 任务过程数据，含目标/进展/执行结果
     """
     user_id: str = Field(..., min_length=1, max_length=128, description="用户唯一标识")
     scene_id: Optional[str] = Field(None, max_length=128, description="场景标识")
     session_id: Optional[str] = Field(None, max_length=128, description="会话ID")
     task_id: Optional[str] = Field(None, max_length=128, description="任务标识")
-    messages: list[MessageItem] = Field(..., min_length=1, max_length=100, description="对话消息数组")
+    interaction_type: str = Field(
+        default="dialogue",
+        description="数据类型: dialogue(对话记录) / session(历史会话) / task_process(任务过程)"
+    )
+    messages: list[MessageItem] = Field(
+        default_factory=list, max_length=100, description="对话消息数组（dialogue/session 类型使用）"
+    )
+    # 历史会话专用字段
+    session_time: Optional[str] = Field(None, description="历史会话发生时间 (ISO 8601)")
+    session_source: Optional[str] = Field(None, max_length=256, description="历史会话来源智能体/场景")
+    session_summary: Optional[str] = Field(None, max_length=10000, description="历史会话摘要/内容")
+    # 任务过程专用字段
+    task_goal: Optional[str] = Field(None, max_length=2000, description="任务目标")
+    task_progress: Optional[str] = Field(None, max_length=5000, description="任务进展描述")
+    task_result: Optional[str] = Field(None, max_length=5000, description="任务执行结果")
     metadata: Optional[dict[str, Any]] = Field(None, description="扩展元数据")
+
+    @field_validator("interaction_type")
+    @classmethod
+    def validate_interaction_type(cls, v: str) -> str:
+        allowed = {"dialogue", "session", "task_process"}
+        v_lower = v.strip().lower()
+        if v_lower not in allowed:
+            raise ValueError(f"非法 interaction_type: '{v}'，允许: {', '.join(sorted(allowed))}")
+        return v_lower
 
     @field_validator("user_id")
     @classmethod
@@ -63,12 +89,38 @@ class MemoryWriteRequest(BaseModel):
             return v.strip().lower()
         return v
 
+    @field_validator("messages")
+    @classmethod
+    def validate_messages_for_type(cls, v: list, info) -> list:
+        """session/task_process 类型允许空 messages，dialogue 类型必须有 messages"""
+        itype = info.data.get("interaction_type", "dialogue") if info.data else "dialogue"
+        if itype == "dialogue" and len(v) == 0:
+            raise ValueError("dialogue 类型必须提供 messages 数组")
+        return v
+
     def get_content_text(self) -> str:
-        """将 messages 数组拼接为单个文本（用于 mem0 LLM 抽取）"""
-        lines = []
+        """将数据内容拼接为单个文本（用于 mem0 LLM 抽取）"""
+        parts = []
+        # 对话消息
         for i, m in enumerate(self.messages):
-            lines.append(f"[{m.role}](轮次{i + 1}): {m.content}")
-        return "\n".join(lines)
+            parts.append(f"[{m.role}](轮次{i + 1}): {m.content}")
+        # 历史会话
+        if self.interaction_type == "session":
+            if self.session_summary:
+                parts.append(f"[历史会话摘要]: {self.session_summary}")
+            if self.session_source:
+                parts.append(f"[会话来源]: {self.session_source}")
+            if self.session_time:
+                parts.append(f"[会话时间]: {self.session_time}")
+        # 任务过程
+        if self.interaction_type == "task_process":
+            if self.task_goal:
+                parts.append(f"[任务目标]: {self.task_goal}")
+            if self.task_progress:
+                parts.append(f"[任务进展]: {self.task_progress}")
+            if self.task_result:
+                parts.append(f"[执行结果]: {self.task_result}")
+        return "\n".join(parts) if parts else ""
 
     def get_last_role(self) -> str:
         """获取最后一条消息的角色"""
@@ -107,12 +159,21 @@ class MemoryWriteResponse(BaseModel):
 # ============================================================
 
 class AsyncWriteRequest(BaseModel):
-    """异步写入请求 — 同 write 格式"""
+    """异步写入请求 — 同 write 格式，支持三种数据类型"""
     user_id: str = Field(..., min_length=1, max_length=128)
     scene_id: Optional[str] = Field(None, max_length=128)
     session_id: Optional[str] = Field(None, max_length=128)
     task_id: Optional[str] = Field(None, max_length=128)
-    messages: list[MessageItem] = Field(..., min_length=1, max_length=100)
+    interaction_type: str = Field(default="dialogue")
+    messages: list[MessageItem] = Field(default_factory=list, max_length=100)
+    # 历史会话专用字段
+    session_time: Optional[str] = Field(None)
+    session_source: Optional[str] = Field(None, max_length=256)
+    session_summary: Optional[str] = Field(None, max_length=10000)
+    # 任务过程专用字段
+    task_goal: Optional[str] = Field(None, max_length=2000)
+    task_progress: Optional[str] = Field(None, max_length=5000)
+    task_result: Optional[str] = Field(None, max_length=5000)
     metadata: Optional[dict[str, Any]] = Field(None)
 
     @field_validator("user_id")

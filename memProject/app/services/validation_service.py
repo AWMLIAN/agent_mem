@@ -41,6 +41,8 @@ REQUIRED_FIELDS = ["user_id", "content", "session_id"]
 # ID 最大长度
 MAX_ID_LENGTH = 128
 MAX_CONTENT_LENGTH = 50000
+MAX_SESSION_SUMMARY_LENGTH = 10000
+MAX_TASK_FIELD_LENGTH = 5000
 
 
 class ValidationResult:
@@ -313,3 +315,80 @@ def validate_and_standardize(
     )
 
     return data
+
+
+# ============================================================
+# MemoryWriteRequest 类型感知校验
+# ============================================================
+
+def validate_write_request_by_type(
+    interaction_type: str,
+    messages: list,
+    session_summary: str | None = None,
+    session_time: str | None = None,
+    task_goal: str | None = None,
+    task_progress: str | None = None,
+    task_result: str | None = None,
+) -> ValidationResult:
+    """
+    根据 interaction_type 对写入请求进行差异化校验。
+
+    规则：
+    - dialogue:      messages 不能为空
+    - session:       messages 或 session_summary 至少有一个
+    - task_process:  messages 或 task_goal/task_progress/task_result 至少有一个
+    """
+    result = ValidationResult()
+
+    if interaction_type == "dialogue":
+        if not messages:
+            result.add_error("dialogue 类型必须提供 messages 数组")
+
+    elif interaction_type == "session":
+        has_messages = bool(messages)
+        has_summary = bool(session_summary and session_summary.strip())
+        if not has_messages and not has_summary:
+            result.add_error("session 类型必须提供 messages 或 session_summary")
+        if session_time:
+            err = _validate_iso8601(session_time)
+            if err:
+                result.add_error(f"session_time 格式错误: {err}")
+        if session_summary and len(session_summary) > MAX_SESSION_SUMMARY_LENGTH:
+            result.add_error(
+                f"session_summary 长度超过限制 ({len(session_summary)} > {MAX_SESSION_SUMMARY_LENGTH})"
+            )
+
+    elif interaction_type == "task_process":
+        has_messages = bool(messages)
+        has_task_data = bool(
+            (task_goal and task_goal.strip()) or
+            (task_progress and task_progress.strip()) or
+            (task_result and task_result.strip())
+        )
+        if not has_messages and not has_task_data:
+            result.add_error(
+                "task_process 类型必须提供 messages 或 task_goal/task_progress/task_result"
+            )
+        for field_name, value in [
+            ("task_goal", task_goal),
+            ("task_progress", task_progress),
+            ("task_result", task_result),
+        ]:
+            if value and len(value) > MAX_TASK_FIELD_LENGTH:
+                result.add_error(
+                    f"{field_name} 长度超过限制 ({len(value)} > {MAX_TASK_FIELD_LENGTH})"
+                )
+
+    return result
+
+
+def _validate_iso8601(value: str) -> str | None:
+    """校验 ISO 8601 时间格式，返回错误信息或 None"""
+    try:
+        from datetime import datetime
+        # 尝试解析
+        normalized = value.strip().replace(" ", "T", 1) if "T" not in value else value.strip()
+        datetime.fromisoformat(normalized)
+        return None
+    except (ValueError, TypeError) as e:
+        return str(e)
