@@ -143,8 +143,8 @@ class MemorySearchRequest(BaseModel):
     top_k: int = Field(default=10, ge=1, le=50)
     time_start: Optional[datetime] = Field(None)
     time_end: Optional[datetime] = Field(None)
-    rerank: bool = Field(default=False, description="是否启用二次排序")
     include_scores: bool = Field(default=True)
+    rerank: bool = Field(default=True, description="启用 Reranker 二次排序（+150-200ms，默认开启）")
 
 
 # ============================================================

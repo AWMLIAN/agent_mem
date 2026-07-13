@@ -70,6 +70,7 @@ class RetrievalConfig(BaseSettings):
     recency_weight: float = 0.15
     importance_weight: float = 0.15
     confidence_weight: float = 0.1
+    enable_rerank: bool = True
 
 
 class GenerationConfig(BaseSettings):

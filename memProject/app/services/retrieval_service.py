@@ -78,7 +78,7 @@ def search(
     top_k: int = 10,
     include_inactive: bool = False,
     include_scores: bool = True,
-    rerank: bool = False,
+    rerank: bool = True,
 ) -> dict:
     """多信号融合检索：mem0混合搜索 + 应用层后过滤"""
     start = time.perf_counter()

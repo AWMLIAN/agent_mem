@@ -65,6 +65,7 @@ retrieval:
   recency_weight: 0.15
   importance_weight: 0.15
   confidence_weight: 0.1
+  enable_rerank: true
 
 # 记忆生成配置
 generation:
