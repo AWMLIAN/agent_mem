@@ -2,7 +2,7 @@
 """
 记忆生成流水线 — 单元测试（Mock 外部依赖）。
 
-测试：LLM Client、Embedding Client、MemoryExtractor、MemoryGenerator、Dedup Service。
+测试：LLM Client、Embedding Client、MemoryExtractor、MemoryGenerator、Dedup Service
 """
 
 import pytest

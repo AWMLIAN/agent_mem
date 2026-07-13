@@ -1,1 +1,33 @@
-.idea/vcs.xml
+# IDE
+.idea/
+
+# Environment & Secrets
+.env
+*.env.local
+*.env.production
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-data/
+
+# Tools (bundled binaries, not project code)
+tools/
+
+# Test artifacts
+*.db
+test_frontend.db

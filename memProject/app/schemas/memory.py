@@ -204,29 +204,8 @@ class MemorySearchRequest(BaseModel):
     top_k: int = Field(default=10, ge=1, le=50)
     time_start: Optional[datetime] = Field(None)
     time_end: Optional[datetime] = Field(None)
-    rerank: bool = Field(default=False, description="是否启用二次排序")
     include_scores: bool = Field(default=True)
-
-
-class MemoryResultItem(BaseModel):
-    """检索结果单条"""
-    memory_id: str
-    content: str
-    summary: Optional[str] = None
-    relevance_score: Optional[float] = None
-    memory_type: str = "unknown"
-    scene_id: Optional[str] = None
-    task_id: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-class MemorySearchResponse(BaseModel):
-    """检索响应"""
-    query: str
-    results: list[MemoryResultItem] = Field(default_factory=list)
-    total_candidates: int = Field(default=0)
-    elapsed_ms: Optional[int] = Field(None)
+    rerank: bool = Field(default=True, description="启用 Reranker 二次排序（+150-200ms，默认开启）")
 
 
 # ============================================================
@@ -247,21 +226,6 @@ class ContextRequest(BaseModel):
     include_task_state: bool = Field(default=True)
 
 
-class ContextFragment(BaseModel):
-    """上下文片段"""
-    memory_type: str
-    content: str
-    memory_ids: list[str] = Field(default_factory=list)
-
-
-class ContextResponse(BaseModel):
-    """上下文响应"""
-    fragments: list[ContextFragment] = Field(default_factory=list)
-    formatted_text: str = Field(default="")
-    memory_count: int = Field(default=0)
-    estimated_tokens: int = Field(default=0)
-
-
 # ============================================================
 # 更新 / 删除
 # ============================================================
@@ -277,21 +241,7 @@ class MemoryUpdateRequest(BaseModel):
     tags: Optional[list[str]] = Field(None)
 
 
-class MemoryUpdateResponse(BaseModel):
-    """更新响应"""
-    memory_id: str
-    updated: bool = True
-    version: int = 1
-
-
 class MemoryDeleteRequest(BaseModel):
     """删除记忆请求（软删除）"""
     memory_id: str = Field(..., description="记忆唯一标识")
     reason: Optional[str] = Field(None)
-
-
-class MemoryDeleteResponse(BaseModel):
-    """删除响应"""
-    memory_id: str
-    deleted: bool = True
-    previous_status: str = "active"
