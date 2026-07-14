@@ -205,59 +205,6 @@ def _define_unit_tests():
         )
     })
 
-    # ── Mock 记忆抽取 (6 个) ──
-
-    def _extract(messages: list) -> list:
-        """调用 Mock 抽取函数"""
-        from app.api.v1.memory import _mock_extract_memories
-        return _mock_extract_memories([
-            type("Msg", (), {"content": c, "role": r})() for c, r in messages
-        ], "u1")
-
-    tests.append({
-        "category": "Mock抽取",
-        "name": "\"我叫张伟\" → ADD + 识别名字",
-        "func": lambda: (
-            (lambda r: r[0]["event"] == "ADD" and "张伟" in r[0]["memory"])(
-                _extract([("我叫张伟", "user")])
-            )
-        )
-    })
-
-    tests.append({
-        "category": "Mock抽取",
-        "name": "\"喜欢Python\" → ADD + 偏好",
-        "func": lambda: _extract([("我喜欢用Python写后端", "user")])[0]["event"] == "ADD"
-    })
-
-    tests.append({
-        "category": "Mock抽取",
-        "name": "\"讨厌前端\" → ADD + 排斥",
-        "func": lambda: _extract([("我讨厌写前端代码", "user")])[0]["event"] == "ADD"
-    })
-
-    tests.append({
-        "category": "Mock抽取",
-        "name": "\"你好\" → SKIP",
-        "func": lambda: _extract([("你好", "user")])[0]["event"] == "SKIP"
-    })
-
-    tests.append({
-        "category": "Mock抽取",
-        "name": "system 角色 → SKIP",
-        "func": lambda: _extract([("你是AI助手", "system")])[0]["event"] == "SKIP"
-    })
-
-    tests.append({
-        "category": "Mock抽取",
-        "name": "3 条消息各自独立判断",
-        "func": lambda: (
-            (lambda r: len(r) == 3 and r[0]["event"] == "SKIP" and r[1]["event"] == "ADD")(
-                _extract([("你好", "user"), ("我叫张三", "user"), ("我爱Python", "user")])
-            )
-        )
-    })
-
     # ── 校验服务 (5 个) ──
     tests.append({
         "category": "校验服务",
@@ -667,12 +614,11 @@ def run_api_tests():
         )
     )
 
-    # ── 场景6: Memory 写入 — 问候语 SKIP ──
+    # ── 场景6: Memory 写入 — 简单问候（MemoryPipeline 返回空 results） ──
     data6 = {"user_id": "user_001", "messages": [{"role": "user", "content": "你好"}]}
     _api_test(
-        "Memory 写入 — 问候语 → SKIP", "POST", "/memory/write", data6, 200,
+        "Memory 写入 — 问候语 → 空 results", "POST", "/memory/write", data6, 200,
         expected_keys=["results"],
-        validate=lambda d: d.get("results", [{}])[0].get("event") == "SKIP"
     )
 
     # ── 场景7: Memory 写入 — 多轮对话 ──

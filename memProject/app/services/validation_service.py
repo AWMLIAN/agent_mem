@@ -59,6 +59,7 @@ class ValidationResult:
     def raise_if_invalid(self) -> None:
         if not self.is_valid:
             raise ValidationError(
+                code="INVALID_PARAM",
                 message="数据校验失败",
                 detail={"errors": self.errors},
             )

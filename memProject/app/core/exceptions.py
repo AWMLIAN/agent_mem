@@ -19,8 +19,9 @@ class AppException(Exception):
 # ---- 接入层异常 (4xx) ----
 
 class ValidationError(AppException):
-    def __init__(self, message: str = "参数校验失败", detail: Optional[dict] = None):
-        super().__init__("VALIDATION_ERROR", message, 422, detail)
+    def __init__(self, message: str = "参数校验失败", detail: Optional[dict] = None,
+                 code: str = "VALIDATION_ERROR"):
+        super().__init__(code, message, 422, detail)
 
 
 class AuthenticationError(AppException):
