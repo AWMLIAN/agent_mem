@@ -32,8 +32,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Database connection OK")
         await create_pgvector_extension()
 
+    # 尝试启动 MQ Producer（可选，Kafka 不可用时不影响服务）
+    try:
+        from app.services.mq_producer import mq_producer
+        await mq_producer.start()
+        if mq_producer.is_available:
+            logger.info("MQ Producer started — Kafka available")
+        else:
+            logger.warning("MQ Producer not available — Kafka may not be running")
+    except Exception as e:
+        logger.warning(f"MQ Producer init failed (non-fatal): {e}")
+
     logger.info("Application startup complete")
     yield
+    # 关闭 MQ Producer
+    try:
+        from app.services.mq_producer import mq_producer
+        await mq_producer.stop()
+    except Exception:
+        pass
     from app.mcp_client import mcp_client as mc
     await mc.close_all()
     logger.info("Application shutting down")

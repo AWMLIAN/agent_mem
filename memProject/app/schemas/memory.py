@@ -245,3 +245,17 @@ class MemoryDeleteRequest(BaseModel):
     """删除记忆请求（软删除）"""
     memory_id: str = Field(..., description="记忆唯一标识")
     reason: Optional[str] = Field(None)
+
+
+class MemoryUpdateResponse(BaseModel):
+    """更新记忆响应"""
+    memory_id: str = Field(..., description="记忆 ID")
+    updated: bool = Field(..., description="是否更新成功")
+    version: int = Field(default=0, description="更新后版本号")
+
+
+class MemoryDeleteResponse(BaseModel):
+    """删除记忆响应"""
+    memory_id: str = Field(..., description="记忆 ID")
+    deleted: bool = Field(..., description="是否删除成功")
+    previous_status: str = Field(default="active", description="删除前状态")
