@@ -14,8 +14,10 @@ Memory Store Service — 记忆持久层的统一读写服务。
 替换原来通过 MCP Server 中转的 mem0 路径。
 """
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
+from uuid import uuid4
 
 from sqlalchemy import select, delete, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +28,44 @@ from app.models.base import Memory
 from app.services.embedding_client import EmbeddingClient, embedding_client as _emb_singleton
 
 logger = get_logger("memory_store")
+
+
+async def _log_retrieval(
+    request_id: str,
+    agent_id: Optional[str],
+    user_id: str,
+    query: str,
+    filter_conditions: dict,
+    top_k: int,
+    results: list[dict],
+) -> None:
+    """fire-and-forget 写入检索请求和结果到 T_RETRIEVAL_REQUEST / T_RETRIEVAL_RESULT。"""
+    try:
+        from app.core.database import async_session_factory
+        from app.models.base import RetrievalRequest, RetrievalResult
+
+        async with async_session_factory() as session:
+            req = RetrievalRequest(
+                request_id=request_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                query_text=query,
+                filter_conditions=filter_conditions,
+                top_k=top_k,
+            )
+            session.add(req)
+
+            for rank, item in enumerate(results, 1):
+                session.add(RetrievalResult(
+                    request_id=request_id,
+                    memory_id=item.get("memory_id", ""),
+                    rank=rank,
+                    relevance_score=item.get("relevance_score"),
+                ))
+
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"检索日志写入失败 (非致命): {e}")
 
 
 class MemoryStore:
@@ -55,15 +95,34 @@ class MemoryStore:
     # Search
     # ================================================================
 
+    @staticmethod
+    def _truncate_text(text: str, max_length: Optional[int]) -> str:
+        """截断文本到指定长度，超出时追加省略号。"""
+        if not max_length or max_length <= 0:
+            return text
+        if len(text) <= max_length:
+            return text
+        return text[:max_length] + "..."
+
+    @staticmethod
+    def _apply_status_filter(stmt, status: Optional[list[str]]):
+        """对查询应用状态筛选。不传或空列表时默认只查 active。"""
+        if status:
+            return stmt.where(Memory.status.in_(status))
+        return stmt.where(Memory.status == "active")
+
     async def search(
         self,
         query: str,
         user_id: str,
         db: AsyncSession,
+        agent_id: Optional[str] = None,
         scene_id: Optional[str] = None,
         task_id: Optional[str] = None,
         session_id: Optional[str] = None,
         memory_types: Optional[list[str]] = None,
+        status: Optional[list[str]] = None,
+        max_content_length: Optional[int] = None,
         time_start: Optional[datetime] = None,
         time_end: Optional[datetime] = None,
         top_k: int = 10,
@@ -78,6 +137,9 @@ class MemoryStore:
         3. 回 PostgreSQL 加载完整 Memory 对象
         4. 按元数据条件过滤
         5. 返回 Top-K 条
+
+        status: 不传或传空列表时默认只查 active；传具体值时按传入列表过滤。
+        max_content_length: 传入时截断 content 字段，不传则返回完整内容。
         """
         import time as time_module
         start = time_module.perf_counter()
@@ -89,8 +151,11 @@ class MemoryStore:
             logger.warning(f"Embedding failed for search, falling back to DB-only: {e}")
             return await self._db_only_search(
                 query=query, user_id=user_id, db=db,
+                agent_id=agent_id,
                 scene_id=scene_id, task_id=task_id, session_id=session_id,
-                memory_types=memory_types, time_start=time_start, time_end=time_end,
+                memory_types=memory_types, status=status,
+                max_content_length=max_content_length,
+                time_start=time_start, time_end=time_end,
                 top_k=top_k,
             )
 
@@ -114,10 +179,8 @@ class MemoryStore:
                 logger.warning(f"Qdrant search failed: {e}")
 
         # Step 3: PostgreSQL query with metadata filters
-        stmt = select(Memory).where(
-            Memory.user_id == user_id,
-            Memory.status == "active",
-        )
+        stmt = select(Memory).where(Memory.user_id == user_id)
+        stmt = self._apply_status_filter(stmt, status)
 
         if scene_id:
             stmt = stmt.where(Memory.scene_id == scene_id)
@@ -145,16 +208,20 @@ class MemoryStore:
         results = []
         for mem in memories:
             score = qdrant_scores.get(mem.memory_id, 0.0)
+            raw_content = mem.content or ""
             results.append({
                 "memory_id": mem.memory_id,
-                "content": mem.content or "",
+                "content": self._truncate_text(raw_content, max_content_length),
                 "summary": mem.summary or "",
+                "key_points": mem.key_points or [],
                 "relevance_score": round(score, 4) if score > 0 else None,
                 "memory_type": mem.memory_type or "unknown",
                 "tags": mem.tags or [],
                 "entities": mem.entities or [],
                 "importance": float(mem.importance or 0.5),
                 "confidence": float(mem.confidence or 0.5),
+                "agent_id": mem.agent_id,
+                "source_type": mem.source_type or "extracted",
                 "scene_id": mem.scene_id,
                 "task_id": mem.task_id,
                 "session_id": mem.session_id,
@@ -177,6 +244,30 @@ class MemoryStore:
 
         elapsed = int((time_module.perf_counter() - start) * 1000)
 
+        # fire-and-forget 写入检索日志
+        filter_conditions = {
+            "scene_id": scene_id,
+            "task_id": task_id,
+            "session_id": session_id,
+            "memory_types": memory_types,
+            "status": status,
+            "time_start": time_start.isoformat() if time_start else None,
+            "time_end": time_end.isoformat() if time_end else None,
+            "top_k": top_k,
+        }
+        request_id = f"retr_{uuid4().hex[:24]}"
+        asyncio.create_task(
+            _log_retrieval(
+                request_id=request_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                query=query,
+                filter_conditions=filter_conditions,
+                top_k=top_k,
+                results=results,
+            )
+        )
+
         return {
             "query": query,
             "results": results,
@@ -189,10 +280,13 @@ class MemoryStore:
         query: str,
         user_id: str,
         db: AsyncSession,
+        agent_id: Optional[str] = None,
         scene_id: Optional[str] = None,
         task_id: Optional[str] = None,
         session_id: Optional[str] = None,
         memory_types: Optional[list[str]] = None,
+        status: Optional[list[str]] = None,
+        max_content_length: Optional[int] = None,
         time_start: Optional[datetime] = None,
         time_end: Optional[datetime] = None,
         top_k: int = 10,
@@ -201,10 +295,8 @@ class MemoryStore:
         import time as time_module
         start = time_module.perf_counter()
 
-        stmt = select(Memory).where(
-            Memory.user_id == user_id,
-            Memory.status == "active",
-        )
+        stmt = select(Memory).where(Memory.user_id == user_id)
+        stmt = self._apply_status_filter(stmt, status)
 
         if scene_id:
             stmt = stmt.where(Memory.scene_id == scene_id)
@@ -232,14 +324,17 @@ class MemoryStore:
             hits = sum(1 for kw in keywords if kw in content_lower)
             results.append({
                 "memory_id": mem.memory_id,
-                "content": mem.content or "",
+                "content": self._truncate_text(mem.content or "", max_content_length),
                 "summary": mem.summary or "",
+                "key_points": mem.key_points or [],
                 "relevance_score": round(hits / max(len(keywords), 1), 4),
                 "memory_type": mem.memory_type or "unknown",
                 "tags": mem.tags or [],
                 "entities": mem.entities or [],
                 "importance": float(mem.importance or 0.5),
                 "confidence": float(mem.confidence or 0.5),
+                "agent_id": mem.agent_id,
+                "source_type": mem.source_type or "extracted",
                 "scene_id": mem.scene_id,
                 "task_id": mem.task_id,
                 "session_id": mem.session_id,
@@ -254,6 +349,30 @@ class MemoryStore:
         results = results[:top_k]
 
         elapsed = int((time_module.perf_counter() - start) * 1000)
+
+        # fire-and-forget 写入检索日志（降级路径）
+        filter_conditions = {
+            "scene_id": scene_id,
+            "task_id": task_id,
+            "session_id": session_id,
+            "memory_types": memory_types,
+            "status": status,
+            "time_start": time_start.isoformat() if time_start else None,
+            "time_end": time_end.isoformat() if time_end else None,
+            "top_k": top_k,
+        }
+        request_id = f"retr_{uuid4().hex[:24]}"
+        asyncio.create_task(
+            _log_retrieval(
+                request_id=request_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                query=query,
+                filter_conditions=filter_conditions,
+                top_k=top_k,
+                results=results,
+            )
+        )
 
         return {
             "query": query,
@@ -317,6 +436,8 @@ class MemoryStore:
                 "entities": mem.entities or [],
                 "importance": float(mem.importance or 0.5),
                 "confidence": float(mem.confidence or 0.5),
+                "agent_id": mem.agent_id,
+                "source_type": mem.source_type or "extracted",
                 "status": mem.status,
                 "version": mem.version,
                 "scene_id": mem.scene_id,
@@ -385,11 +506,16 @@ class MemoryStore:
         query: str,
         user_id: str,
         db: AsyncSession,
+        agent_id: Optional[str] = None,
         scene_id: Optional[str] = None,
         task_id: Optional[str] = None,
         session_id: Optional[str] = None,
         max_tokens: int = 3000,
         group_by_type: bool = True,
+        top_k: int = 20,
+        max_content_length: Optional[int] = 200,
+        memory_types: Optional[list[str]] = None,
+        status: Optional[list[str]] = None,
         include_preferences: bool = True,
         include_facts: bool = True,
         include_task_state: bool = True,
@@ -398,45 +524,57 @@ class MemoryStore:
         检索记忆并格式化为 Prompt 上下文。
 
         先搜索相关记忆，然后按类型分组拼接为自然语言文本。
-        """
-        # 确定要检索的记忆类型
-        types = []
-        if include_preferences:
-            types.append("preference")
-        if include_facts:
-            types.extend(["fact", "constraint", "process"])
-        if include_task_state:
-            types.extend(["task_state", "decision"])
 
-        # 搜索记忆
+        top_k: 最大返回条数，默认 20。
+        max_content_length: 单条 content 截断长度，默认 200；传 None 不截断。
+        memory_types: 精确指定类型时覆盖 include_* 布尔（向前兼容）。
+        status: 不传时默认只查 active。
+        """
+        # 确定要检索的记忆类型 — memory_types 优先，兼容旧的 include_* 布尔
+        if memory_types is not None:
+            types = memory_types
+        else:
+            types = []
+            if include_preferences:
+                types.append("preference")
+            if include_facts:
+                types.extend(["fact", "constraint", "process"])
+            if include_task_state:
+                types.extend(["task_state", "decision"])
+
+        # 搜索记忆（带上长度控制参数）
         search_result = await self.search(
             query=query,
             user_id=user_id,
             db=db,
+            agent_id=agent_id,
             scene_id=scene_id,
             task_id=task_id,
             session_id=session_id,
             memory_types=types if types else None,
-            top_k=20,
+            status=status,
+            max_content_length=max_content_length,
+            top_k=top_k,
         )
 
         memories = search_result.get("results", [])
 
-        # 生成格式化文本
+        # 生成格式化文本（传入 max_content_length 替换硬编码 200）
         if group_by_type:
-            formatted = self._format_grouped(memories)
+            formatted = self._format_grouped(memories, max_content_length)
         else:
-            formatted = self._format_flat(memories)
+            formatted = self._format_flat(memories, max_content_length)
 
         # 粗略估算 token 数（中英文混合：约 1.5 字符/token）
         estimated_chars = len(formatted)
         estimated_tokens = max(1, int(estimated_chars / 1.5))
 
-        # 如果超出 max_tokens，截断
+        # 如果超出 max_tokens，截断并重新估算
         if estimated_tokens > max_tokens:
             ratio = max_tokens / estimated_tokens
             truncate_chars = int(estimated_chars * ratio)
             formatted = formatted[:truncate_chars] + "\n...(截断)"
+            estimated_tokens = max_tokens
 
         return {
             "formatted_text": formatted,
@@ -446,7 +584,7 @@ class MemoryStore:
         }
 
     @staticmethod
-    def _format_grouped(memories: list[dict]) -> str:
+    def _format_grouped(memories: list[dict], max_content_length: Optional[int] = 200) -> str:
         """按类型分组格式化记忆。"""
         type_labels = {
             "fact": "📋 关键事实",
@@ -473,20 +611,20 @@ class MemoryStore:
                 if summary and summary != content:
                     lines.append(f"- {summary}")
                 else:
-                    lines.append(f"- {content[:200]}")
+                    lines.append(f"- {MemoryStore._truncate_text(content, max_content_length)}")
                 for kp in key_points[:3]:
                     lines.append(f"  - {kp}")
 
         return "\n".join(lines).strip()
 
     @staticmethod
-    def _format_flat(memories: list[dict]) -> str:
+    def _format_flat(memories: list[dict], max_content_length: Optional[int] = 200) -> str:
         """扁平化格式化记忆。"""
         lines = []
         for i, m in enumerate(memories):
             content = m.get("content", "")
             summary = m.get("summary", "")
-            text = summary or content[:200]
+            text = summary or MemoryStore._truncate_text(content, max_content_length)
             lines.append(f"[{i + 1}] ({m.get('memory_type', 'fact')}) {text}")
         return "\n".join(lines)
 

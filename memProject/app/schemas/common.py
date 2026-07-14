@@ -38,6 +38,19 @@ def ok(data: Any = None, message: str = "ok") -> dict:
     return {"code": 0, "message": message, "data": data}
 
 
+def error(
+    message: str = "error",
+    code: int = -1,
+    data: Any = None,
+    error_code: str | None = None,
+) -> dict:
+    """快速构造错误响应。前端先看 code != 0，后续可按 error_code 细分。"""
+    resp = {"code": code, "message": message, "data": data}
+    if error_code:
+        resp["error_code"] = error_code
+    return resp
+
+
 def paginated(items: list, total: int, page: int, page_size: int) -> dict:
     return {
         "code": 0,

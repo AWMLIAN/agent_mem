@@ -47,7 +47,7 @@ from app.core.database import get_db
 from app.core.exceptions import ValidationError
 from app.core.logger import get_logger
 from app.models.base import InteractionRecord
-from app.schemas.common import ok
+from app.schemas.common import error, ok
 from app.schemas.memory import (
     AsyncWriteRequest,
     AsyncWriteResponse,
@@ -520,6 +520,7 @@ async def _fallback_sync_write(
 async def memory_search(
     body: MemorySearchRequest,
     db: AsyncSession = Depends(get_db),
+    agent_id: str = Depends(get_current_agent),
 ):
     """
     语义检索历史记忆 — Qdrant 向量检索 + PostgreSQL 元数据过滤。
@@ -531,18 +532,21 @@ async def memory_search(
 
     try:
         result = await memory_store.search(
-            query=body.query,
-            user_id=body.user_id,
-            db=db,
-            scene_id=body.scene_id,
-            task_id=body.task_id,
-            session_id=body.session_id,
-            memory_types=body.memory_types,
-            time_start=body.time_start,
-            time_end=body.time_end,
-            top_k=body.top_k,
-            rerank=body.rerank,
-        )
+                query=body.query,
+                user_id=body.user_id,
+                db=db,
+                agent_id=agent_id,
+                scene_id=body.scene_id,
+                task_id=body.task_id,
+                session_id=body.session_id,
+                memory_types=body.memory_types,
+                status=body.status,
+                max_content_length=body.max_content_length,
+                time_start=body.time_start,
+                time_end=body.time_end,
+                top_k=body.top_k,
+                rerank=body.rerank,
+            )
         logger.info(
             f"Search: user={body.user_id}, query='{body.query[:50]}...', "
             f"found={len(result['results'])}, elapsed={result['elapsed_ms']}ms"
@@ -558,17 +562,25 @@ async def memory_search(
                 task_id=body.task_id,
                 session_id=body.session_id,
                 memory_types=body.memory_types,
+                status=body.status,
+                max_content_length=body.max_content_length,
                 top_k=body.top_k,
                 rerank=body.rerank,
             )
             return ok(result)
-        except Exception:
-            return ok({
-                "query": body.query,
-                "results": [],
-                "total_candidates": 0,
-                "elapsed_ms": 0,
-            })
+        except Exception as e2:
+            logger.error(f"Search failed (both paths): {e2}")
+            return error(
+                message="检索服务暂时不可用",
+                code=-1,
+                data={
+                    "query": body.query,
+                    "results": [],
+                    "total_candidates": 0,
+                    "elapsed_ms": 0,
+                },
+                error_code="SEARCH_FAILED",
+            )
 
 
 # ============================================================
@@ -579,6 +591,7 @@ async def memory_search(
 async def memory_context(
     body: ContextRequest,
     db: AsyncSession = Depends(get_db),
+    agent_id: str = Depends(get_current_agent),
 ):
     """
     检索记忆并格式化为可直接注入 AI Prompt 的文本。
@@ -590,11 +603,16 @@ async def memory_context(
             query=body.query,
             user_id=body.user_id,
             db=db,
+            agent_id=agent_id,
             scene_id=body.scene_id,
             task_id=body.task_id,
             session_id=body.session_id,
             max_tokens=body.max_tokens,
             group_by_type=body.group_by_type,
+            top_k=body.top_k,
+            max_content_length=body.max_content_length,
+            memory_types=body.memory_types,
+            status=body.status,
             include_preferences=body.include_preferences,
             include_facts=body.include_facts,
             include_task_state=body.include_task_state,
@@ -602,12 +620,17 @@ async def memory_context(
         return ok(result)
     except Exception as e:
         logger.error(f"Context generation failed: {e}")
-        return ok({
-            "formatted_text": "",
-            "fragments": [],
-            "memory_count": 0,
-            "estimated_tokens": 0,
-        })
+        return error(
+            message="上下文生成失败",
+            code=-2,
+            data={
+                "formatted_text": "",
+                "fragments": [],
+                "memory_count": 0,
+                "estimated_tokens": 0,
+            },
+            error_code="CONTEXT_FAILED",
+        )
 
 
 # ============================================================
