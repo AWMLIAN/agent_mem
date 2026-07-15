@@ -116,6 +116,7 @@ class LLMClient:
         user_content: str,
         output_schema: dict,
         temperature: float = DEFAULT_TEMPERATURE,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> dict:
         """
         发送带 system prompt 的结构化抽取请求，要求 JSON 输出。
@@ -134,6 +135,7 @@ class LLMClient:
         raw = await self.chat_completion(
             messages=messages,
             temperature=temperature,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"},
         )
 

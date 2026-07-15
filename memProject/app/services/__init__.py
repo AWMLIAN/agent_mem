@@ -5,6 +5,24 @@ from app.services.llm_client import llm_client, LLMClient
 from app.services.embedding_client import embedding_client, EmbeddingClient
 from app.services.memory_pipeline import memory_pipeline, MemoryPipeline
 from app.services.memory_store import memory_store, MemoryStore
+from app.services.memory_extractor import (
+    MemoryExtractor,
+    ExtractionResult,
+    KeyFactsResult,
+    TaskStateResult,
+    DecisionResult,
+    PreferenceResult,
+    ProcessResult,
+    FeedbackResult,
+    KeyFactExtractor,
+    TaskStateExtractor,
+    DecisionExtractor,
+    PreferenceExtractor,
+    ProcessExtractor,
+    FeedbackExtractor,
+)
+from app.services.memory_generator import MemoryGenerator, MemoryCandidate
+from app.services.memory_dedup import DedupService, DedupResult, DedupAction
 
 __all__ = [
     "mem0_client",
@@ -19,4 +37,23 @@ __all__ = [
     "MemoryPipeline",
     "memory_store",
     "MemoryStore",
+    "MemoryExtractor",
+    "ExtractionResult",
+    "KeyFactsResult",
+    "TaskStateResult",
+    "DecisionResult",
+    "PreferenceResult",
+    "ProcessResult",
+    "FeedbackResult",
+    "KeyFactExtractor",
+    "TaskStateExtractor",
+    "DecisionExtractor",
+    "PreferenceExtractor",
+    "ProcessExtractor",
+    "FeedbackExtractor",
+    "MemoryGenerator",
+    "MemoryCandidate",
+    "DedupService",
+    "DedupResult",
+    "DedupAction",
 ]

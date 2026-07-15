@@ -23,7 +23,7 @@ from app.services.memory_extractor import ExtractionResult
 logger = get_logger("memory_generator")
 
 VALID_MEMORY_TYPES = {
-    "fact", "preference", "task_state", "decision", "constraint", "process",
+    "fact", "preference", "task_state", "decision", "constraint", "process", "correction",
 }
 
 
@@ -94,12 +94,22 @@ class MemoryGenerator:
                 confirmed_plans=json.dumps(data.get("confirmed_plans", []), ensure_ascii=False),
                 selection_rationale=json.dumps(data.get("selection_rationale", []), ensure_ascii=False),
                 execution_results=json.dumps(data.get("execution_results", []), ensure_ascii=False),
+                style_preferences=json.dumps(data.get("style_preferences", []), ensure_ascii=False),
+                habitual_preferences=json.dumps(data.get("habitual_preferences", []), ensure_ascii=False),
+                decision_tendencies=json.dumps(data.get("decision_tendencies", []), ensure_ascii=False),
+                execution_actions=json.dumps(data.get("execution_actions", []), ensure_ascii=False),
+                intermediate_conclusions=json.dumps(data.get("intermediate_conclusions", []), ensure_ascii=False),
+                failure_records=json.dumps(data.get("failure_records", []), ensure_ascii=False),
+                corrections=json.dumps(data.get("corrections", []), ensure_ascii=False),
+                confirmation_statuses=json.dumps(data.get("confirmation_statuses", []), ensure_ascii=False),
+                replacement_relationships=json.dumps(data.get("replacement_relationships", []), ensure_ascii=False),
             )
 
             llm_result = await self._llm.extract_structured(
                 system_prompt=MEMORY_GENERATION_SYSTEM_PROMPT,
                 user_content=user_content,
                 output_schema=MEMORY_GENERATION_OUTPUT_SCHEMA,
+                max_tokens=4000,  # 记忆生成可能返回多条，需要更大输出空间
             )
 
             raw_memories = llm_result.get("memories", [])

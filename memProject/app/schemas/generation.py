@@ -7,7 +7,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-EXTRACTION_VALID_TYPES = {"key_fact", "task_state", "decision"}
+EXTRACTION_VALID_TYPES = {"key_fact", "task_state", "decision", "preference", "process", "feedback"}
 
 
 # ============================================================
@@ -26,8 +26,8 @@ class GenerationRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话标识")
     task_id: Optional[str] = Field(None, description="任务标识")
     extraction_types: list[str] = Field(
-        default=["key_fact", "task_state", "decision"],
-        description="抽取类型: key_fact, task_state, decision"
+        default=["key_fact", "task_state", "decision", "preference", "process", "feedback"],
+        description="抽取类型: key_fact, task_state, decision, preference, process, feedback"
     )
     source_record_ids: Optional[list[str]] = Field(None, description="来源记录 ID")
     metadata: Optional[dict] = Field(None, description="业务元数据")
@@ -75,7 +75,7 @@ class BatchGenerationRequest(BaseModel):
 
 class MemoryGenerationDetail(BaseModel):
     """单条记忆生成详情"""
-    action: str = Field(..., description="处理动作: keep_new/merge/discard/update_existing")
+    action: str = Field(..., description="处理动作: keep_new/merge/discard/update_existing/conflict")
     memory_id: Optional[str] = Field(None, description="记忆 ID")
     content_preview: str = Field("", description="记忆内容预览（前 100 字）")
     memory_type: str = Field("fact", description="记忆类型")
@@ -87,6 +87,12 @@ class MemoryGenerationDetail(BaseModel):
 class GenerationResponse(BaseModel):
     """同步生成响应"""
     memory_ids: list[str] = Field(default_factory=list, description="生成的记忆 ID 列表")
+    new_count: int = Field(0, description="新增数量")
+    merged_count: int = Field(0, description="合并数量")
+    discarded_count: int = Field(0, description="丢弃数量")
+    updated_count: int = Field(0, description="更新数量")
+    conflict_count: int = Field(0, description="冲突数量")
+    details: list[MemoryGenerationDetail] = Field(default_factory=list, description="详情列表")
     new_count: int = Field(default=0, description="新创建数量")
     merged_count: int = Field(default=0, description="合并数量")
     discarded_count: int = Field(default=0, description="丢弃（重复）数量")

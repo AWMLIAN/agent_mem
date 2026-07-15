@@ -13,11 +13,20 @@ from app.services.llm_client import LLMClient
 from app.services.embedding_client import EmbeddingClient
 from app.services.memory_extractor import (
     MemoryExtractor, KeyFactExtractor, TaskStateExtractor, DecisionExtractor,
+    PreferenceExtractor, ProcessExtractor, FeedbackExtractor,
     ExtractionResult, KeyFactsResult, TaskStateResult, DecisionResult,
+    PreferenceResult, ProcessResult, FeedbackResult,
 )
 from app.services.memory_generator import MemoryGenerator, MemoryCandidate
 from app.services.memory_dedup import (
     DedupService, DedupResult, DedupAction, SimilarMemory,
+)
+from app.services.memory_quality import (
+    judge_extraction_value,
+    verify_candidate_quality,
+    verify_candidates_batch,
+    QualityReport,
+    ValueJudgment,
 )
 
 
@@ -515,3 +524,482 @@ class TestDedupService:
         nouns = DedupService._extract_nouns(text)
         assert "Python" in nouns or "python" in [n.lower() for n in nouns]
         assert any("Web" in n or "web" in n.lower() for n in nouns) or any("应用" == n for n in nouns)
+
+
+# ============================================================
+# New Extractor Tests (Preference, Process, Feedback)
+# ============================================================
+
+class TestPreferenceExtractor:
+    """测试用户偏好抽取器"""
+
+    @pytest.fixture
+    def mock_llm(self):
+        return MagicMock(spec=LLMClient)
+
+    @pytest.mark.asyncio
+    async def test_preference_extraction(self, mock_llm):
+        """测试偏好抽取"""
+        mock_llm.extract_structured = AsyncMock(return_value={
+            "style_preferences": [
+                {"preference_object": "表达风格", "preference_content": "正式严谨", "applicable_scenario": "技术方案", "confidence": 0.9},
+            ],
+            "habitual_preferences": [
+                {"preference_object": "开发语言", "preference_content": "优先使用 Python", "applicable_scenario": "后端开发", "confidence": 0.85},
+            ],
+            "decision_tendencies": [
+                {"tendency_type": "risk_attitude", "tendency_content": "偏好稳定成熟方案", "evidence": "用户多次拒绝实验性技术", "confidence": 0.8},
+            ],
+        })
+
+        extractor = PreferenceExtractor(mock_llm)
+        result = await extractor.extract("用户偏好正式严谨的表达风格，优先使用 Python 开发")
+
+        assert len(result.style_preferences) == 1
+        assert result.style_preferences[0]["preference_content"] == "正式严谨"
+        assert len(result.habitual_preferences) == 1
+        assert len(result.decision_tendencies) == 1
+        assert result.decision_tendencies[0]["tendency_type"] == "risk_attitude"
+
+    @pytest.mark.asyncio
+    async def test_preference_empty_text(self, mock_llm):
+        """空文本返回空结果"""
+        extractor = PreferenceExtractor(mock_llm)
+        result = await extractor.extract("")
+        assert result.is_empty()
+
+
+class TestProcessExtractor:
+    """测试过程信息抽取器"""
+
+    @pytest.fixture
+    def mock_llm(self):
+        return MagicMock(spec=LLMClient)
+
+    @pytest.mark.asyncio
+    async def test_process_extraction(self, mock_llm):
+        """测试过程信息抽取"""
+        mock_llm.extract_structured = AsyncMock(return_value={
+            "execution_actions": [
+                {"action_name": "向量检索", "action_type": "search", "input_summary": "查询 Qdrant", "output_summary": "返回 5 条结果", "tool_name": "Qdrant"},
+            ],
+            "intermediate_conclusions": [
+                {"conclusion": "相似度不足需扩大检索范围", "basis": "最高分仅 0.6", "confidence": 0.7, "is_final": False},
+            ],
+            "failure_records": [
+                {"failure_point": "Qdrant 连接超时", "failure_reason": "网络不稳定", "attempted_recovery": "重试 3 次", "was_resolved": True, "lesson_learned": "增加超时时间和重试机制"},
+            ],
+        })
+
+        extractor = ProcessExtractor(mock_llm)
+        result = await extractor.extract("执行了向量检索，Qdrant 超时后重试成功")
+
+        assert len(result.execution_actions) == 1
+        assert result.execution_actions[0]["action_type"] == "search"
+        assert len(result.intermediate_conclusions) == 1
+        assert len(result.failure_records) == 1
+        assert result.failure_records[0]["was_resolved"] is True
+
+
+class TestFeedbackExtractor:
+    """测试反馈修正抽取器"""
+
+    @pytest.fixture
+    def mock_llm(self):
+        return MagicMock(spec=LLMClient)
+
+    @pytest.mark.asyncio
+    async def test_feedback_extraction(self, mock_llm):
+        """测试反馈修正抽取"""
+        mock_llm.extract_structured = AsyncMock(return_value={
+            "corrections": [
+                {"corrected_content": "使用 Redis 缓存", "correction_instruction": "改用 Memcached", "original_context": "架构讨论", "correction_type": "revision"},
+            ],
+            "confirmation_statuses": [
+                {"confirmed_item": "微服务方案", "status": "confirmed", "parties_involved": ["user", "agent"], "context": "最终确认"},
+            ],
+            "replacement_relationships": [
+                {"replaced_content": "Redis 缓存方案", "replacement_content": "Memcached 缓存方案", "replacement_reason": "性能考虑", "scope": "global"},
+            ],
+        })
+
+        extractor = FeedbackExtractor(mock_llm)
+        result = await extractor.extract("不要把 Redis 用于缓存，改用 Memcached。微服务方案确认。")
+
+        assert len(result.corrections) == 1
+        assert result.corrections[0]["correction_type"] == "revision"
+        assert len(result.confirmation_statuses) == 1
+        assert result.confirmation_statuses[0]["status"] == "confirmed"
+        assert len(result.replacement_relationships) == 1
+        assert result.replacement_relationships[0]["scope"] == "global"
+
+
+# ============================================================
+# ExtractionResult with 6 types
+# ============================================================
+
+class TestExtractionResultV2:
+    """测试六类型 ExtractionResult"""
+
+    def test_to_dict_with_all_six_types(self):
+        """测试包含全部六种类型的 to_dict"""
+        result = ExtractionResult(
+            key_facts=KeyFactsResult(
+                business_objects=[{"name": "Test"}],
+            ),
+            task_state=TaskStateResult(
+                current_progress="进行中",
+            ),
+            decisions=DecisionResult(
+                confirmed_plans=[{"plan": "方案A"}],
+            ),
+            preferences=PreferenceResult(
+                style_preferences=[{"preference_object": "风格", "preference_content": "正式", "confidence": 0.8}],
+            ),
+            process=ProcessResult(
+                execution_actions=[{"action_name": "检索", "action_type": "search"}],
+            ),
+            feedback=FeedbackResult(
+                corrections=[{"corrected_content": "旧方案", "correction_instruction": "新方案", "correction_type": "revision"}],
+            ),
+            source_text="test",
+        )
+
+        d = result.to_dict()
+        assert len(d["business_objects"]) == 1
+        assert d["current_progress"] == "进行中"
+        assert len(d["style_preferences"]) == 1
+        assert len(d["execution_actions"]) == 1
+        assert len(d["corrections"]) == 1
+
+    def test_is_empty_all_empty(self):
+        """全部为空时 is_empty() = True"""
+        result = ExtractionResult(source_text="empty")
+        assert result.is_empty()
+
+    def test_is_empty_with_new_types(self):
+        """新类型有内容时 is_empty() = False"""
+        result = ExtractionResult(
+            preferences=PreferenceResult(
+                style_preferences=[{"preference_object": "test", "preference_content": "test", "confidence": 0.5}],
+            ),
+        )
+        assert not result.is_empty()
+
+
+# ============================================================
+# Quality Verification Tests
+# ============================================================
+
+class TestQualityVerification:
+    """测试质量校验"""
+
+    def test_judge_extraction_value_with_data(self):
+        """有价值数据 → should_keep=True"""
+        result = ExtractionResult(
+            key_facts=KeyFactsResult(
+                business_objects=[{"name": "Test"}],
+                constraints=[{"type": "temporal", "description": "deadline", "severity": "high"}],
+            ),
+            task_state=TaskStateResult(current_progress="进行中"),
+            decisions=DecisionResult(confirmed_plans=[{"plan": "方案A"}]),
+        )
+        judgment = judge_extraction_value(result)
+        assert judgment.should_keep is True
+        assert judgment.overall_value > 0.0
+
+    def test_judge_extraction_value_empty(self):
+        """空数据 → should_keep=False"""
+        result = ExtractionResult(source_text="empty")
+        judgment = judge_extraction_value(result)
+        assert judgment.should_keep is False
+        assert judgment.overall_value == 0.0
+
+    def test_verify_candidate_quality_valid(self):
+        """有效候选 → active"""
+        candidate = MemoryCandidate(
+            content="用户偏好使用 Python 进行后端开发",
+            summary="用户偏好 Python",
+            key_points=["Python 偏好"],
+            memory_type="preference",
+            tags=["python", "preference"],
+            entities=["Python"],
+            importance=0.8,
+            confidence=0.9,
+        )
+        report = verify_candidate_quality(candidate)
+        assert report.is_accurate is True
+        assert report.is_usable is True
+        assert report.suggested_status == "active"
+        assert report.quality_score > 0.5
+
+    def test_verify_candidate_quality_empty_content(self):
+        """空内容 → pending"""
+        candidate = MemoryCandidate(
+            content="",
+            summary="",
+            memory_type="fact",
+        )
+        report = verify_candidate_quality(candidate)
+        assert report.is_accurate is False
+        assert report.suggested_status == "pending"
+
+    def test_verify_candidate_quality_low_confidence(self):
+        """低置信度 → pending"""
+        candidate = MemoryCandidate(
+            content="用户可能偏好某种开发方式，但不确定具体是什么",
+            summary="不确定偏好",
+            key_points=["不确定"],
+            memory_type="preference",
+            tags=["uncertain"],
+            entities=[],
+            importance=0.3,
+            confidence=0.2,
+        )
+        report = verify_candidate_quality(candidate)
+        assert report.suggested_status == "pending"
+
+    def test_verify_candidate_quality_hallucination_detection(self):
+        """幻觉标记检测"""
+        candidate = MemoryCandidate(
+            content="无法确定 用户的具体需求，可能是 需要 [TODO] 确认 N/A",
+            summary="不确定",
+            key_points=["k1"],
+            memory_type="fact",
+            tags=["t1"],
+            entities=["e1"],
+            importance=0.3,
+            confidence=0.3,
+        )
+        report = verify_candidate_quality(candidate)
+        assert report.is_accurate is False
+        assert "too_many_uncertain_markers" in report.issues
+
+    def test_verify_candidates_batch(self):
+        """批量质量校验"""
+        candidates = [
+            MemoryCandidate(
+                content="有效记忆内容，包含足够长的语义信息用于测试",
+                summary="摘要",
+                key_points=["k1"],
+                memory_type="fact",
+                tags=["t1"],
+                entities=["e1"],
+                importance=0.7,
+                confidence=0.8,
+            ),
+            MemoryCandidate(
+                content="",
+                summary="",
+                memory_type="fact",
+            ),
+        ]
+        reports = verify_candidates_batch(candidates)
+        assert len(reports) == 2
+        assert reports[0].suggested_status == "active"
+        assert reports[1].suggested_status == "pending"
+
+
+# ============================================================
+# Conflict Detection & Audit Trail Tests
+# ============================================================
+
+class TestConflictDetection:
+    """测试冲突检测"""
+
+    @pytest.fixture
+    def mock_embedding(self):
+        emb = MagicMock(spec=EmbeddingClient)
+        emb.embed_single = AsyncMock(return_value=[0.1] * 1024)
+        return emb
+
+    @pytest.fixture
+    def mock_qdrant(self):
+        qdrant = MagicMock()
+        qdrant.is_available = True
+        return qdrant
+
+    def test_detect_preference_change(self, mock_embedding, mock_qdrant):
+        """检测偏好变化"""
+        from app.models.base import Memory
+
+        service = DedupService(mock_embedding, mock_qdrant)
+        candidate = MemoryCandidate(
+            content="用户不再偏好详细报告，改为简短摘要格式",
+            memory_type="preference",
+        )
+        existing = Memory(
+            content="用户偏好详细的报告格式，包含完整分析和多维度数据展示",
+            memory_type="preference",
+        )
+        best = SimilarMemory(
+            memory_id="mem_001",
+            content=existing.content,
+            vector_score=0.82,
+            keyword_overlap=0.6,
+            identity_match=True,
+        )
+
+        is_conflict, reason = service._detect_conflict(candidate, existing, best)
+        assert is_conflict is True
+        assert "偏好变化" in reason
+
+    def test_detect_constraint_adjustment(self, mock_embedding, mock_qdrant):
+        """检测约束调整"""
+        from app.models.base import Memory
+
+        service = DedupService(mock_embedding, mock_qdrant)
+        candidate = MemoryCandidate(
+            content="必须使用 PostgreSQL，不能使用 MySQL",
+            memory_type="constraint",
+        )
+        existing = Memory(
+            content="数据库必须使用 MySQL",
+            memory_type="constraint",
+        )
+        best = SimilarMemory(
+            memory_id="mem_002",
+            content=existing.content,
+            vector_score=0.85,
+            keyword_overlap=0.7,
+            identity_match=True,
+        )
+
+        is_conflict, reason = service._detect_conflict(candidate, existing, best)
+        assert is_conflict is True
+
+    def test_no_conflict_low_similarity(self, mock_embedding, mock_qdrant):
+        """低相似度不触发冲突检测"""
+        from app.models.base import Memory
+
+        service = DedupService(mock_embedding, mock_qdrant)
+        candidate = MemoryCandidate(content="无关内容", memory_type="fact")
+        existing = Memory(content="另一段无关内容", memory_type="fact")
+        best = SimilarMemory(
+            memory_id="mem_003",
+            content=existing.content,
+            vector_score=0.6,
+            keyword_overlap=0.2,
+            identity_match=False,
+        )
+
+        is_conflict, reason = service._detect_conflict(candidate, existing, best)
+        assert is_conflict is False
+
+    def test_decide_action_conflict(self, mock_embedding, mock_qdrant):
+        """高相似度 + 冲突 → CONFLICT"""
+        from app.models.base import Memory
+
+        service = DedupService(mock_embedding, mock_qdrant)
+        candidate = MemoryCandidate(
+            content="用户不再使用 Redis 作为缓存方案，改为使用 Memcached",
+            memory_type="preference",
+        )
+        existing = Memory(
+            memory_id="mem_004",
+            content="用户使用 Redis 作为主要的缓存方案并已部署到生产环境",
+            memory_type="preference",
+        )
+        best = SimilarMemory(
+            memory_id="mem_004",
+            content=existing.content,
+            vector_score=0.85,
+            keyword_overlap=0.7,
+            identity_match=True,
+        )
+
+        action = service._decide_action(
+            vector_score=best.vector_score,
+            keyword_overlap=best.keyword_overlap,
+            identity_match=best.identity_match,
+            candidate=candidate,
+            best_match=best,
+            existing_memories=[existing],
+        )
+        assert action == DedupAction.CONFLICT
+
+    def test_check_identity_with_session(self, mock_embedding, mock_qdrant):
+        """session_id 校验"""
+        from app.models.base import Memory
+
+        service = DedupService(mock_embedding, mock_qdrant)
+        candidate = MemoryCandidate(content="test", entities=["E1", "E2"])
+        existing = Memory(
+            content="test",
+            entities=["E1", "E2"],
+            session_id="sess_001",
+            task_id=None,
+        )
+
+        # 相同 session → identity match
+        assert service._check_identity(candidate, existing, session_id="sess_001") is True
+
+
+# ============================================================
+# DedupAction CONFLICT
+# ============================================================
+
+class TestDedupActionConflict:
+    """测试 CONFLICT 动作"""
+
+    def test_conflict_action_exists(self):
+        """CONFLICT 是有效的 DedupAction"""
+        assert hasattr(DedupAction, "CONFLICT")
+        assert DedupAction.CONFLICT.value == "conflict"
+
+    def test_conflict_result_structure(self):
+        """CONFLICT 结果包含冲突信息"""
+        result = DedupResult(
+            action=DedupAction.CONFLICT,
+            content="新偏好内容",
+            memory_type="preference",
+            confidence=0.3,
+            conflict_with=["mem_old_001"],
+            tags=["conflict", "preference"],
+            message="检测到冲突",
+        )
+        assert result.action == DedupAction.CONFLICT
+        assert result.confidence == 0.3
+        assert "mem_old_001" in result.conflict_with
+        assert "conflict" in result.tags
+
+
+# ============================================================
+# MemoryQuality integration
+# ============================================================
+
+class TestMemoryQuality:
+    """测试记忆质量服务"""
+
+    def test_value_judgment_all_types_active(self):
+        """全部类型活跃 → 高分"""
+        result = ExtractionResult(
+            key_facts=KeyFactsResult(business_objects=[{"name": "X"}]),
+            task_state=TaskStateResult(current_progress="P"),
+            decisions=DecisionResult(confirmed_plans=[{"plan": "A"}]),
+            preferences=PreferenceResult(style_preferences=[{"preference_object": "S", "preference_content": "C", "confidence": 0.5}]),
+            process=ProcessResult(execution_actions=[{"action_name": "A", "action_type": "search"}]),
+            feedback=FeedbackResult(corrections=[{"corrected_content": "X", "correction_instruction": "Y", "correction_type": "revision"}]),
+        )
+        judgment = judge_extraction_value(result)
+        assert judgment.should_keep is True
+        assert judgment.overall_value >= 0.5  # All types contribute
+
+    def test_quality_report_fields(self):
+        """QualityReport 各字段正确填充"""
+        candidate = MemoryCandidate(
+            content="测试记忆内容足够长，包含完整的语义信息",
+            summary="测试摘要",
+            key_points=["要点1"],
+            memory_type="fact",
+            tags=["测试"],
+            entities=["实体1"],
+            importance=0.7,
+            confidence=0.8,
+        )
+        report = verify_candidate_quality(candidate, source_text="原始文本")
+        assert report.is_accurate is True
+        assert report.is_usable is True
+        assert report.suggested_status == "active"
+        assert 0.0 <= report.quality_score <= 1.0
+        assert len(report.issues) == 0
