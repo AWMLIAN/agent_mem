@@ -592,81 +592,80 @@ async def memory_search(
 # 上下文 — 对齐前端对接文档 二.1 节
 # ============================================================
 
-@router.post("/context", summary="Prompt 上下文片段（三层聚合）")
+@router.post("/context", summary="Prompt 上下文片段")
 async def memory_context(
     body: ContextRequest,
     db: AsyncSession = Depends(get_db),
     agent_id: str = Depends(get_current_agent),
 ):
     """
-    Prompt 上下文 — 层级感知聚合：
+    Prompt 上下文。
 
-    - 有 task_id   → get_task_view()     任务级：当前目标 + 进展时间线
-    - 有 session_id → get_session_context() 会话级：按类型分组 + 关键内容
-    - 仅 user_id   → get_user_profile()    用户级：偏好 + 事实
+    基础层：memory_store.get_context() — Qdrant 语义检索 + 类型分组
+    增强层：有 task_id / session_id 时，额外附加三层聚合结果
     """
-    fragments = []
-    formatted = ""
-    memory_count = 0
-
     try:
+        # 基础层：master 的语义检索上下文
+        result = await memory_store.get_context(
+            query=body.query,
+            user_id=body.user_id,
+            db=db,
+            agent_id=agent_id,
+            scene_id=body.scene_id,
+            task_id=body.task_id,
+            session_id=body.session_id,
+            max_tokens=body.max_tokens,
+            group_by_type=body.group_by_type,
+            top_k=body.top_k,
+            max_content_length=body.max_content_length,
+            memory_types=body.memory_types,
+            status=body.status,
+            include_preferences=body.include_preferences,
+            include_facts=body.include_facts,
+            include_task_state=body.include_task_state,
+        )
+
+        # 增强层：叠加上下文聚合（任务级/会话级/用户级）
         if body.task_id:
             task_view = await get_task_view(db, body.task_id)
             if task_view.get("current_goal"):
-                fragments.append({
+                result["fragments"].append({
                     "memory_type": "task_goal",
                     "content": task_view["current_goal"]["content"],
                     "memory_ids": [task_view["current_goal"]["memory_id"]],
                 })
             for item in task_view.get("progress_timeline", []):
-                fragments.append({
+                result["fragments"].append({
                     "memory_type": f"task_{item.get('status', 'progress')}",
                     "content": item["content"],
                     "memory_ids": [item["memory_id"]],
                 })
-            memory_count = len(fragments)
-            formatted = "\n\n".join(f"[任务记忆] {f['content']}" for f in fragments)
 
         elif body.session_id:
             sess_ctx = await get_session_context(db, body.session_id)
-            for mtype, items in sess_ctx.get("by_type", {}).items():
-                for item in items:
-                    fragments.append({
-                        "memory_type": mtype,
-                        "content": item["content"],
-                        "memory_ids": [item["memory_id"]],
-                    })
             for item in sess_ctx.get("key_items", []):
-                fragments.append({
+                result["fragments"].append({
                     "memory_type": f"key_{item.get('memory_type', '')}",
                     "content": item["content"],
                     "memory_ids": [item["memory_id"]],
                     "key": True,
                 })
-            memory_count = len(fragments)
-            formatted = "\n\n".join(f"[{f['memory_type']}] {f['content']}" for f in fragments)
 
-        else:
+        elif body.include_preferences or body.include_facts:
             profile = await get_user_profile(db, body.user_id)
-            for pref in profile.get("preferences", []):
-                fragments.append({"memory_type": "preference", "content": pref, "memory_ids": []})
-            for fact in profile.get("facts", []):
-                fragments.append({"memory_type": "fact", "content": fact, "memory_ids": []})
-            memory_count = len(fragments)
-
-            parts = []
             if body.include_preferences and profile.get("preferences"):
-                parts.append("## 用户偏好\n" + "\n".join(f"- {p}" for p in profile["preferences"]))
+                for pref in profile["preferences"]:
+                    result["fragments"].append({
+                        "memory_type": "preference", "content": pref, "memory_ids": []
+                    })
             if body.include_facts and profile.get("facts"):
-                parts.append("## 关键事实\n" + "\n".join(f"- {f}" for f in profile["facts"]))
-            formatted = "\n\n".join(parts)
+                for fact in profile["facts"]:
+                    result["fragments"].append({
+                        "memory_type": "fact", "content": fact, "memory_ids": []
+                    })
 
-        return ok({
-            "fragments": fragments,
-            "formatted_text": formatted,
-            "memory_count": memory_count,
-            "estimated_tokens": len(formatted) // 2,
-        })
+        result["memory_count"] = len(result.get("fragments", []))
+        return ok(result)
     except Exception as e:
         logger.error(f"Context generation failed: {e}")
         return error(
