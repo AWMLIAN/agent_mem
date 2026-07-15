@@ -42,14 +42,40 @@ class MemoryWriteRequest(BaseModel):
     """
     同步写入请求 — 对齐前端对接文档 一.1 节。
 
-    messages 数组为 Primary 格式，支持多轮对话批量写入。
+    支持三种数据类型（通过 interaction_type 区分）：
+    - dialogue:     当前对话记录，messages 数组为 Primary 格式
+    - session:      历史会话数据，含会话时间/来源/摘要
+    - task_process: 任务过程数据，含目标/进展/执行结果
     """
     user_id: str = Field(..., min_length=1, max_length=128, description="用户唯一标识")
     scene_id: Optional[str] = Field(None, max_length=128, description="场景标识")
     session_id: Optional[str] = Field(None, max_length=128, description="会话ID")
     task_id: Optional[str] = Field(None, max_length=128, description="任务标识")
-    messages: list[MessageItem] = Field(..., min_length=1, max_length=100, description="对话消息数组")
+    interaction_type: str = Field(
+        default="dialogue",
+        description="数据类型: dialogue(对话记录) / session(历史会话) / task_process(任务过程)"
+    )
+    messages: list[MessageItem] = Field(
+        default_factory=list, max_length=100, description="对话消息数组（dialogue/session 类型使用）"
+    )
+    # 历史会话专用字段
+    session_time: Optional[str] = Field(None, description="历史会话发生时间 (ISO 8601)")
+    session_source: Optional[str] = Field(None, max_length=256, description="历史会话来源智能体/场景")
+    session_summary: Optional[str] = Field(None, max_length=10000, description="历史会话摘要/内容")
+    # 任务过程专用字段
+    task_goal: Optional[str] = Field(None, max_length=2000, description="任务目标")
+    task_progress: Optional[str] = Field(None, max_length=5000, description="任务进展描述")
+    task_result: Optional[str] = Field(None, max_length=5000, description="任务执行结果")
     metadata: Optional[dict[str, Any]] = Field(None, description="扩展元数据")
+
+    @field_validator("interaction_type")
+    @classmethod
+    def validate_interaction_type(cls, v: str) -> str:
+        allowed = {"dialogue", "session", "task_process"}
+        v_lower = v.strip().lower()
+        if v_lower not in allowed:
+            raise ValueError(f"非法 interaction_type: '{v}'，允许: {', '.join(sorted(allowed))}")
+        return v_lower
 
     @field_validator("user_id")
     @classmethod
@@ -63,12 +89,38 @@ class MemoryWriteRequest(BaseModel):
             return v.strip().lower()
         return v
 
+    @field_validator("messages")
+    @classmethod
+    def validate_messages_for_type(cls, v: list, info) -> list:
+        """session/task_process 类型允许空 messages，dialogue 类型必须有 messages"""
+        itype = info.data.get("interaction_type", "dialogue") if info.data else "dialogue"
+        if itype == "dialogue" and len(v) == 0:
+            raise ValueError("dialogue 类型必须提供 messages 数组")
+        return v
+
     def get_content_text(self) -> str:
-        """将 messages 数组拼接为单个文本（用于 mem0 LLM 抽取）"""
-        lines = []
+        """将数据内容拼接为单个文本（用于 mem0 LLM 抽取）"""
+        parts = []
+        # 对话消息
         for i, m in enumerate(self.messages):
-            lines.append(f"[{m.role}](轮次{i + 1}): {m.content}")
-        return "\n".join(lines)
+            parts.append(f"[{m.role}](轮次{i + 1}): {m.content}")
+        # 历史会话
+        if self.interaction_type == "session":
+            if self.session_summary:
+                parts.append(f"[历史会话摘要]: {self.session_summary}")
+            if self.session_source:
+                parts.append(f"[会话来源]: {self.session_source}")
+            if self.session_time:
+                parts.append(f"[会话时间]: {self.session_time}")
+        # 任务过程
+        if self.interaction_type == "task_process":
+            if self.task_goal:
+                parts.append(f"[任务目标]: {self.task_goal}")
+            if self.task_progress:
+                parts.append(f"[任务进展]: {self.task_progress}")
+            if self.task_result:
+                parts.append(f"[执行结果]: {self.task_result}")
+        return "\n".join(parts) if parts else ""
 
     def get_last_role(self) -> str:
         """获取最后一条消息的角色"""
@@ -107,12 +159,21 @@ class MemoryWriteResponse(BaseModel):
 # ============================================================
 
 class AsyncWriteRequest(BaseModel):
-    """异步写入请求 — 同 write 格式"""
+    """异步写入请求 — 同 write 格式，支持三种数据类型"""
     user_id: str = Field(..., min_length=1, max_length=128)
     scene_id: Optional[str] = Field(None, max_length=128)
     session_id: Optional[str] = Field(None, max_length=128)
     task_id: Optional[str] = Field(None, max_length=128)
-    messages: list[MessageItem] = Field(..., min_length=1, max_length=100)
+    interaction_type: str = Field(default="dialogue")
+    messages: list[MessageItem] = Field(default_factory=list, max_length=100)
+    # 历史会话专用字段
+    session_time: Optional[str] = Field(None)
+    session_source: Optional[str] = Field(None, max_length=256)
+    session_summary: Optional[str] = Field(None, max_length=10000)
+    # 任务过程专用字段
+    task_goal: Optional[str] = Field(None, max_length=2000)
+    task_progress: Optional[str] = Field(None, max_length=5000)
+    task_result: Optional[str] = Field(None, max_length=5000)
     metadata: Optional[dict[str, Any]] = Field(None)
 
     @field_validator("user_id")
@@ -136,38 +197,17 @@ class MemorySearchRequest(BaseModel):
     """混合检索请求"""
     query: str = Field(..., description="检索查询文本")
     user_id: str = Field(..., description="用户标识")
-    agent_id: Optional[str] = Field(None)
     scene_id: Optional[str] = Field(None)
-    session_id: Optional[str] = Field(None)
     task_id: Optional[str] = Field(None)
+    session_id: Optional[str] = Field(None)
     memory_types: Optional[list[str]] = Field(None, description="筛选类型: preference/fact/task/decision/constraint")
+    status: Optional[list[str]] = Field(None, description="筛选状态: active/archived/deleted，不传默认只查 active")
     top_k: int = Field(default=10, ge=1, le=50)
+    max_content_length: Optional[int] = Field(default=None, ge=1, le=5000, description="单条 content 最大字符数，超出截断；不传不截断")
     time_start: Optional[datetime] = Field(None)
     time_end: Optional[datetime] = Field(None)
-    include_inactive: bool = Field(default=False)
     include_scores: bool = Field(default=True)
-    rerank: bool = Field(default=False, description="是否启用二次排序")
-
-
-class MemoryResultItem(BaseModel):
-    """检索结果单条"""
-    memory_id: str
-    content: str
-    summary: Optional[str] = None
-    relevance_score: Optional[float] = None
-    memory_type: str = "unknown"
-    scene_id: Optional[str] = None
-    task_id: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-class MemorySearchResponse(BaseModel):
-    """检索响应"""
-    query: str
-    results: list[MemoryResultItem] = Field(default_factory=list)
-    total_candidates: int = Field(default=0)
-    elapsed_ms: Optional[int] = Field(None)
+    rerank: bool = Field(default=True, description="启用 Reranker 二次排序（+150-200ms，默认开启）")
 
 
 # ============================================================
@@ -178,30 +218,23 @@ class ContextRequest(BaseModel):
     """上下文返回请求"""
     query: str = Field(..., description="当前用户问题")
     user_id: str = Field(..., description="用户标识")
-    agent_id: Optional[str] = Field(None)
     scene_id: Optional[str] = Field(None)
-    session_id: Optional[str] = Field(None)
     task_id: Optional[str] = Field(None)
-    max_tokens: int = Field(default=3000)
+    session_id: Optional[str] = Field(None)
+    max_tokens: int = Field(default=3000, ge=1, le=32000)
     group_by_type: bool = Field(default=True)
+    # 返回条数控制 — 暴露给前端，替代硬编码 20
+    top_k: int = Field(default=20, ge=1, le=50)
+    # 单条长度控制 — /context 默认 200，保持格式化截断行为
+    max_content_length: Optional[int] = Field(default=200, ge=1, le=5000, description="单条 content 最大字符数，超出截断")
+    # 精确类型筛选 — 传此参数时覆盖 include_* 布尔
+    memory_types: Optional[list[str]] = Field(None, description="精确筛选类型: preference/fact/task_state/decision/constraint/process")
+    # 状态筛选 — 不传默认只查 active
+    status: Optional[list[str]] = Field(None, description="筛选状态: active/archived/deleted")
+    # 旧: 粗粒度布尔（保留向前兼容）
     include_preferences: bool = Field(default=True)
     include_facts: bool = Field(default=True)
     include_task_state: bool = Field(default=True)
-
-
-class ContextFragment(BaseModel):
-    """上下文片段"""
-    memory_type: str
-    content: str
-    memory_ids: list[str] = Field(default_factory=list)
-
-
-class ContextResponse(BaseModel):
-    """上下文响应"""
-    fragments: list[ContextFragment] = Field(default_factory=list)
-    formatted_text: str = Field(default="")
-    memory_count: int = Field(default=0)
-    estimated_tokens: int = Field(default=0)
 
 
 # ============================================================
@@ -213,17 +246,10 @@ class MemoryUpdateRequest(BaseModel):
     memory_id: str = Field(..., description="记忆唯一标识")
     content: Optional[str] = Field(None)
     summary: Optional[str] = Field(None)
-    status: Optional[str] = Field(None, description="状态: active/deleted/pending_update/conflict")
+    status: Optional[str] = Field(None)
     importance: Optional[float] = Field(None, ge=0, le=1)
     confidence: Optional[float] = Field(None, ge=0, le=1)
     tags: Optional[list[str]] = Field(None)
-
-
-class MemoryUpdateResponse(BaseModel):
-    """更新响应"""
-    memory_id: str
-    updated: bool = True
-    version: int = 1
 
 
 class MemoryDeleteRequest(BaseModel):
@@ -232,8 +258,15 @@ class MemoryDeleteRequest(BaseModel):
     reason: Optional[str] = Field(None)
 
 
+class MemoryUpdateResponse(BaseModel):
+    """更新记忆响应"""
+    memory_id: str = Field(..., description="记忆 ID")
+    updated: bool = Field(..., description="是否更新成功")
+    version: int = Field(default=0, description="更新后版本号")
+
+
 class MemoryDeleteResponse(BaseModel):
-    """删除响应"""
-    memory_id: str
-    deleted: bool = True
-    previous_status: str = "active"
+    """删除记忆响应"""
+    memory_id: str = Field(..., description="记忆 ID")
+    deleted: bool = Field(..., description="是否删除成功")
+    previous_status: str = Field(default="active", description="删除前状态")

@@ -61,10 +61,14 @@ async def get_memory_by_id(db: AsyncSession, memory_id: str) -> Optional[Memory]
 async def create_memory(db: AsyncSession, data: dict) -> Memory:
     """类型感知的记忆创建 — 根据 memory_type 走不同的预处理规则。"""
     memory_type = data.get("memory_type", "fact")
+    # 统一 task/task_state 为一个路由
+    if memory_type == "task":
+        memory_type = "task_state"
+        data["memory_type"] = "task_state"
 
     if memory_type == "preference":
         return await _create_preference(db, data)
-    elif memory_type == "task":
+    elif memory_type == "task_state":
         return await _create_task_memory(db, data)
     else:
         return await _create_fact(db, data)
@@ -126,7 +130,7 @@ async def _create_task_memory(db: AsyncSession, data: dict) -> Memory:
     if task_id and _is_task_goal(content, key_points):
         # 目标类：新目标替换旧目标，旧标记 pending_update
         existing = await search_local(db, {
-            "task_id": task_id, "memory_types": ["task"], "status": "active",
+            "task_id": task_id, "memory_types": ["task_state"], "status": "active",
         })
         old_goals = [m for m in existing if _is_task_goal(m.content or "", m.key_points or [])]
         for m in old_goals:
@@ -317,7 +321,7 @@ async def build_context_query(db: AsyncSession, filters: dict) -> list[Memory]:
         if include_map.get("facts"):
             type_conditions.append(Memory.memory_type == "fact")
         if include_map.get("task_state"):
-            type_conditions.append(Memory.memory_type == "task")
+            type_conditions.append(Memory.memory_type == "task_state")
         if type_conditions:
             from sqlalchemy import or_
             stmt = stmt.where(or_(*type_conditions))
@@ -368,7 +372,7 @@ async def get_session_context(db: AsyncSession, session_id: str) -> dict:
 async def get_task_view(db: AsyncSession, task_id: str) -> dict:
     """任务视图：当前目标 + 进展时间线。"""
     all_memories = await search_local(db, {
-        "task_id": task_id, "memory_types": ["task"],
+        "task_id": task_id, "memory_types": ["task_state"],
     })
     all_memories.sort(key=lambda m: m.created_at or datetime.min)
 
