@@ -57,9 +57,18 @@ class Mem0Config(BaseSettings):
 
 class KafkaConfig(BaseSettings):
     bootstrap_servers: str = "localhost:9092"
-    topic_memory_write: str = "memory.async.write"
-    topic_memory_generate: str = "memory.async.generate"
+    topic_memory_write: str = "memory.write"
+    topic_memory_result: str = "memory.result"
+    topic_memory_dlq: str = "memory.dlq"
     consumer_group: str = "memory-system"
+    max_retries: int = 3
+    retry_backoff_ms: int = 1000
+
+
+class RedisConfig(BaseSettings):
+    url: str = "redis://localhost:6379/0"
+    result_ttl: int = 300
+    result_poll_timeout: float = 5.0
 
 
 class RetrievalConfig(BaseSettings):
@@ -70,6 +79,7 @@ class RetrievalConfig(BaseSettings):
     recency_weight: float = 0.15
     importance_weight: float = 0.15
     confidence_weight: float = 0.1
+    enable_rerank: bool = True
 
 
 class GenerationConfig(BaseSettings):
@@ -77,6 +87,8 @@ class GenerationConfig(BaseSettings):
     schedule_interval_minutes: int = 5
     max_memory_text_length: int = 2000
     max_summary_length: int = 500
+    use_mock_extraction: bool = True
+    use_mq_wait: bool = False
 
 
 class CompressionConfig(BaseSettings):
@@ -110,6 +122,7 @@ class Settings(BaseSettings):
     database: DatabaseConfig = DatabaseConfig()
     mem0: Mem0Config = Mem0Config()
     kafka: KafkaConfig = KafkaConfig()
+    redis: RedisConfig = RedisConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
     generation: GenerationConfig = GenerationConfig()
     compression: CompressionConfig = CompressionConfig()
@@ -156,6 +169,7 @@ def load_settings(config_path: Optional[str] = None) -> Settings:
         database=DatabaseConfig(**resolved.get("database", {})),
         mem0=Mem0Config(**resolved.get("mem0", {})),
         kafka=KafkaConfig(**resolved.get("kafka", {})),
+        redis=RedisConfig(**resolved.get("redis", {})),
         retrieval=RetrievalConfig(**resolved.get("retrieval", {})),
         generation=GenerationConfig(**resolved.get("generation", {})),
         compression=CompressionConfig(**resolved.get("compression", {})),

@@ -341,7 +341,15 @@ class MemoryPipeline:
         task_id: Optional[str] = None,
         source_record_ids: Optional[list[str]] = None,
     ) -> None:
-        """将去重结果持久化到 PostgreSQL 和 Qdrant。"""
+        """将去重结果持久化到 PostgreSQL 和 Qdrant。
+
+        通过 memory_service.create_memory() 走类型感知写入：
+        - preference → 新旧替换
+        - fact → 内容去重 + 冲突检测
+        - task → 目标 vs 进展区分
+        """
+        from app.services.memory_service import create_memory, update_memory_fields, get_memory_by_id
+
         vectors_to_upsert: list[list[float]] = []
         vector_payloads: list[dict] = []
         vector_ids: list[str] = []
@@ -351,35 +359,32 @@ class MemoryPipeline:
                 continue
 
             if dr.action == DedupAction.KEEP_NEW:
-                # 新建记忆
                 memory_id = dr.memory_id or _gen_id("mem")
                 dr.memory_id = memory_id
 
-                memory = Memory(
-                    memory_id=memory_id,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    scene_id=scene_id,
-                    session_id=session_id,
-                    task_id=task_id,
-                    content=dr.content,
-                    summary=dr.summary,
-                    key_points=dr.key_points,
-                    memory_type=dr.memory_type,
-                    tags=dr.tags,
-                    entities=dr.entities,
-                    status="active",
-                    importance=dr.importance,
-                    confidence=dr.confidence,
-                    source_type="extracted",
-                    source_record_ids=source_record_ids or [],
-                    version=1,
-                    created_at=_now(),
-                    updated_at=_now(),
-                )
-                db.add(memory)
+                # 走类型感知写入（偏好替换、事实去重、任务区分）
+                memory = await create_memory(db, {
+                    "memory_id": memory_id,
+                    "user_id": user_id,
+                    "agent_id": agent_id,
+                    "scene_id": scene_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "content": dr.content,
+                    "summary": dr.summary,
+                    "key_points": dr.key_points,
+                    "memory_type": dr.memory_type,
+                    "tags": dr.tags,
+                    "entities": dr.entities,
+                    "status": "active",
+                    "importance": dr.importance,
+                    "confidence": dr.confidence,
+                    "source_type": "extracted",
+                    "source_record_ids": source_record_ids or [],
+                    "version": 1,
+                })
+                await db.flush()
 
-                # 准备向量
                 try:
                     vec = await self.embedding.embed_single(dr.content)
                     vectors_to_upsert.append(vec)
@@ -393,30 +398,23 @@ class MemoryPipeline:
                     logger.warning(f"Failed to embed memory {memory_id}: {e}")
 
             elif dr.action in (DedupAction.MERGE, DedupAction.UPDATE_EXISTING):
-                # 更新已有记忆
                 memory_id = dr.memory_id
                 if not memory_id:
                     continue
 
                 try:
-                    from sqlalchemy import select as _select
-                    result = await db.execute(
-                        _select(Memory).where(Memory.memory_id == memory_id)
-                    )
-                    existing = result.scalar_one_or_none()
-
+                    existing = await get_memory_by_id(db, memory_id)
                     if existing:
-                        existing.content = dr.content
-                        existing.summary = dr.summary
-                        existing.key_points = dr.key_points
-                        existing.tags = dr.tags
-                        existing.entities = dr.entities
-                        existing.importance = dr.importance
-                        existing.confidence = dr.confidence
-                        existing.version = (existing.version or 0) + 1
-                        existing.updated_at = _now()
+                        # 走 service 层的更新逻辑
+                        await update_memory_fields(db, memory_id, {
+                            "content": dr.content,
+                            "summary": dr.summary,
+                            "importance": dr.importance,
+                            "confidence": dr.confidence,
+                            "tags": dr.tags,
+                        })
+                        await db.flush()
 
-                        # 准备更新向量
                         try:
                             vec = await self.embedding.embed_single(dr.content)
                             vectors_to_upsert.append(vec)
@@ -433,7 +431,6 @@ class MemoryPipeline:
                 except Exception as e:
                     logger.error(f"Failed to update memory {memory_id}: {e}")
 
-        # 提交数据库
         try:
             await db.commit()
             logger.info(f"DB committed: {len(dedup_results)} dedup results")

@@ -53,6 +53,9 @@ from app.services.memory_service import (
     list_memories_filtered,
     get_stats,
     get_memory_relations,
+    get_user_profile,
+    get_session_context,
+    get_task_view,
 )
 
 logger = get_logger("memory_api")
@@ -210,17 +213,51 @@ async def memory_write(
 
     await db.commit()
 
-    # --- Mock 记忆抽取（联调期规则，正式期替换为下游 RPC 调用） ---
-    mock_results = _mock_extract_memories(body.messages, effective_user_id)
+    # --- 记忆生成：Pipeline（LLM 提取→生成→去重→存储），Mock 为降级 ---
+    from app.services.memory_pipeline import memory_pipeline as _pipeline
+    from app.core.config import get_settings
 
-    results = [
-        WriteResultItem(
-            id=r["id"],
-            memory=r["memory"],
-            event=MemoryEvent(r["event"]),
-        )
-        for r in mock_results
-    ]
+    settings = get_settings()
+
+    if not settings.generation.use_mock_extraction:
+        # 正式路径：调用 LLM Pipeline
+        try:
+            text = body.get_content_text()
+            pipeline_result = await _pipeline.run(
+                text=text,
+                user_id=effective_user_id,
+                agent_id=agent_id,
+                scene_id=effective_scene_id,
+                session_id=effective_session_id,
+                task_id=body.task_id,
+                db=db,
+            )
+            results = [
+                WriteResultItem(
+                    id=d.get("memory_id", ""),
+                    memory=d.get("content_preview", ""),
+                    event=MemoryEvent.ADD if d.get("action") != "discard" else MemoryEvent.SKIP,
+                )
+                for d in pipeline_result.details
+            ]
+            logger.info(
+                f"[Pipeline] 同步写入完成: user_id={effective_user_id}, "
+                f"memories={pipeline_result.new_count + pipeline_result.merged_count}"
+            )
+        except Exception as e:
+            logger.error(f"Pipeline 失败，降级到 Mock: {e}")
+            mock_results = _mock_extract_memories(body.messages, effective_user_id)
+            results = [
+                WriteResultItem(id=r["id"], memory=r["memory"], event=MemoryEvent(r["event"]))
+                for r in mock_results
+            ]
+    else:
+        # 联调模式：Mock 正则提取
+        mock_results = _mock_extract_memories(body.messages, effective_user_id)
+        results = [
+            WriteResultItem(id=r["id"], memory=r["memory"], event=MemoryEvent(r["event"]))
+            for r in mock_results
+        ]
 
     elapsed = round((time_module.perf_counter() - start) * 1000, 2)
     logger.info(
@@ -341,31 +378,79 @@ async def memory_context(
     db: AsyncSession = Depends(get_db),
     _agent: str = Depends(get_current_agent),
 ):
-    filters = {
-        "user_id": body.user_id,
-        "agent_id": body.agent_id,
-        "scene_id": body.scene_id,
-        "session_id": body.session_id,
-        "task_id": body.task_id,
-        "include_map": {
-            "preferences": body.include_preferences,
-            "facts": body.include_facts,
-            "task_state": body.include_task_state,
-        },
-    }
-    memories = await build_context_query(db, filters)
+    """
+    Prompt 上下文 — 三层聚合：
+
+    - 有 task_id   → get_task_view()    任务级：目标 + 进展时间线
+    - 有 session_id → get_session_context() 会话级：按类型分组 + 关键内容
+    - 仅 user_id   → get_user_profile()    用户级：偏好 + 事实
+    """
     fragments = []
-    for m in memories:
-        fragments.append({
-            "memory_type": m.memory_type,
-            "content": m.content,
-            "memory_ids": [m.memory_id],
-        })
-    formatted = "\n\n".join(f"[{m.memory_type}] {m.content}" for m in memories)
+    formatted = ""
+    memory_count = 0
+
+    if body.task_id:
+        # 任务级聚合
+        task_view = await get_task_view(db, body.task_id)
+        if task_view.get("current_goal"):
+            fragments.append({
+                "memory_type": "task_goal",
+                "content": task_view["current_goal"]["content"],
+                "memory_ids": [task_view["current_goal"]["memory_id"]],
+            })
+        for item in task_view.get("progress_timeline", []):
+            fragments.append({
+                "memory_type": f"task_{item.get('status', 'progress')}",
+                "content": item["content"],
+                "memory_ids": [item["memory_id"]],
+            })
+        memory_count = len(fragments)
+        formatted = "\n\n".join(
+            f"[任务记忆] {f['content']}" for f in fragments
+        )
+
+    elif body.session_id:
+        # 会话级聚合
+        sess_ctx = await get_session_context(db, body.session_id)
+        for mtype, items in sess_ctx.get("by_type", {}).items():
+            for item in items:
+                fragments.append({
+                    "memory_type": mtype,
+                    "content": item["content"],
+                    "memory_ids": [item["memory_id"]],
+                })
+        for item in sess_ctx.get("key_items", []):
+            fragments.append({
+                "memory_type": f"key_{item.get('memory_type', '')}",
+                "content": item["content"],
+                "memory_ids": [item["memory_id"]],
+                "key": True,
+            })
+        memory_count = len(fragments)
+        formatted = "\n\n".join(
+            f"[{f['memory_type']}] {f['content']}" for f in fragments
+        )
+
+    else:
+        # 用户级聚合
+        profile = await get_user_profile(db, body.user_id)
+        for pref in profile.get("preferences", []):
+            fragments.append({"memory_type": "preference", "content": pref, "memory_ids": []})
+        for fact in profile.get("facts", []):
+            fragments.append({"memory_type": "fact", "content": fact, "memory_ids": []})
+        memory_count = len(fragments)
+
+        parts = []
+        if body.include_preferences and profile.get("preferences"):
+            parts.append("## 用户偏好\n" + "\n".join(f"- {p}" for p in profile["preferences"]))
+        if body.include_facts and profile.get("facts"):
+            parts.append("## 关键事实\n" + "\n".join(f"- {f}" for f in profile["facts"]))
+        formatted = "\n\n".join(parts)
+
     return ok({
         "fragments": fragments,
         "formatted_text": formatted,
-        "memory_count": len(memories),
+        "memory_count": memory_count,
         "estimated_tokens": len(formatted) // 2,
     })
 
