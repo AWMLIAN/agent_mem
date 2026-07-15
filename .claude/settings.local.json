@@ -18,7 +18,8 @@
       "Bash(.venv/Scripts/python.exe -c ' *)",
       "Bash(docker exec *)",
       "Bash(.venv/Scripts/python.exe -c \"import qdrant_client; print\\(qdrant_client.__version__\\)\")",
-      "Bash(.venv/Scripts/pip.exe show *)"
+      "Bash(.venv/Scripts/pip.exe show *)",
+      "Bash(docker port *)"
     ]
   }
 }

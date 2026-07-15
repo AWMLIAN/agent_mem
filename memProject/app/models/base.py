@@ -128,11 +128,14 @@ class InteractionRecord(Base):
     scene_id = Column(String(128), nullable=True, index=True)
     session_id = Column(String(128), nullable=False, index=True)
     task_id = Column(String(128), nullable=True, index=True)
+    interaction_type = Column(String(32), default="dialogue", index=True)
     turn_index = Column(Integer, default=0)
     role = Column(String(32), nullable=False)
     content = Column(Text, nullable=False)
     content_type = Column(String(32), default="text")
     processed = Column(Boolean, default=False)
+    status = Column(String(32), default="pending_extract", index=True,
+                    comment="记录状态: pending_extract / processed / failed")
     recorded_at = Column(DateTime(timezone=True), default=_now)
     extra_meta = Column(JSON, default=dict)
 
@@ -140,6 +143,9 @@ class InteractionRecord(Base):
         Index("idx_interaction_session_turn", "session_id", "turn_index"),
         Index("idx_interaction_processed", "processed", "recorded_at"),
         Index("idx_interaction_user_time", "user_id", "recorded_at"),
+        Index("idx_interaction_type_user", "interaction_type", "user_id"),
+        Index("idx_interaction_user_session_time", "user_id", "session_id", "recorded_at"),
+        Index("idx_interaction_status", "status", "recorded_at"),
     )
 
 

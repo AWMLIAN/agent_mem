@@ -4,11 +4,15 @@ Qdrant Client 单例 — 复用 gRPC 连接模式进行向量存储与检索。
 
 与 mem0_client.py 中的 QdrantClient 模式一致：gRPC 端口 6334。
 """
+import uuid
 from typing import Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
     PointStruct,
     VectorParams,
 )
@@ -17,6 +21,11 @@ from app.core.exceptions import VectorStoreError
 from app.core.logger import get_logger
 
 logger = get_logger("qdrant_client")
+
+
+def _str_to_uuid(s: str) -> str:
+    """将字符串 ID 转换为合法的 UUID 格式（基于 uuid5）。"""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, s))
 
 QDRANT_HOST = "localhost"
 QDRANT_GRPC_PORT = 6334
@@ -102,14 +111,17 @@ class QdrantClientSingleton:
             [{"id": str, "score": float, "payload": dict}, ...]
         """
         try:
-            hits = self.client.search(
+            hits = self.client.query_points(
                 collection_name=self._collection_name,
-                query_vector=query_vector,
-                query_filter={
-                    "must": [
-                        {"key": "user_id", "match": {"value": user_id}},
+                query=query_vector,
+                query_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="user_id",
+                            match=MatchValue(value=user_id),
+                        )
                     ]
-                },
+                ),
                 limit=top_k,
                 score_threshold=score_threshold,
             )
@@ -120,7 +132,7 @@ class QdrantClientSingleton:
                     "score": hit.score,
                     "payload": hit.payload or {},
                 }
-                for hit in hits
+                for hit in hits.points
             ]
             logger.info(
                 f"Qdrant search: user={user_id}, top_k={top_k}, found={len(results)}"
@@ -149,7 +161,7 @@ class QdrantClientSingleton:
 
         try:
             points = [
-                PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i])
+                PointStruct(id=_str_to_uuid(ids[i]), vector=vectors[i], payload=payloads[i])
                 for i in range(len(ids))
             ]
             self.client.upsert(
@@ -166,7 +178,7 @@ class QdrantClientSingleton:
         try:
             self.client.delete(
                 collection_name=self._collection_name,
-                points_selector=ids,
+                points_selector=[_str_to_uuid(id_) for id_ in ids],
             )
             logger.info(f"Qdrant delete: {len(ids)} vectors")
         except Exception as e:

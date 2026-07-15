@@ -2,18 +2,37 @@
 """
 记忆核心 API — 对齐前端对接文档。
 
-写入路径：
-  - POST /write       → 同步写入：鉴权→校验→写原始记录→Mock抽取→返回 results
-  - POST /async_write → 异步写入：鉴权→校验→投递MQ→返回 request_id
-  - POST /search      → 检索记忆
-  - POST /list        → 列出全部
-  - POST /delete-all  → 清除全部
+所有端点使用 MemoryPipeline（生成+去重）和 MemoryStore（检索/列表/删除）。
+替换原来的 MCP 中转 + Mock 提取器方案。
+
+端点:
+  POST /write       — 同步写入记忆（支持 Mock / MQ_Wait / Direct Pipeline 三种模式）
+  POST /async_write — 异步写入（即刻返回 request_id）
+  POST /search      — 语义检索记忆（Qdrant + PostgreSQL）
+  POST /list        — 分页列出记忆
+  POST /delete-all  — 清除全部记忆
+  POST /context     — 检索并格式化为 Prompt 上下文
+  PUT  /update      — 更新单条记忆
+  DELETE /delete    — 软删除单条记忆
+
+支持三种数据类型（通过 interaction_type 区分）：
+  - dialogue:     当前对话记录，messages 逐条落库
+  - session:      历史会话数据，含会话时间/来源/摘要
+  - task_process: 任务过程数据，含目标/进展/执行结果
+
+同步写入三种模式:
+  - Mock (use_mock_extraction=True):   中文正则提取，闪电返回，开发期使用
+  - MQ_Wait (use_mq_wait=True):       投递 Kafka → Redis 等待结果 → 返回（伪同步）
+  - Direct Pipeline (default):        直接调用 LLM Pipeline，5-15s 延迟
 """
 
+import asyncio
+import re as re_module
 import time as time_module
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
+from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -23,134 +42,46 @@ from app.api.deps import (
     get_current_session_id,
     get_current_task_id,
 )
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.exceptions import ValidationError
 from app.core.logger import get_logger
-from app.mcp_client import mcp_client
 from app.models.base import InteractionRecord
-from app.services.validation_service import validate_id_format, normalize_id
-from app.schemas.common import ok
+from app.schemas.common import error, ok
 from app.schemas.memory import (
+    AsyncWriteRequest,
+    AsyncWriteResponse,
+    ContextRequest,
+    MemoryDeleteRequest,
+    MemoryDeleteResponse,
+    MemoryEvent,
+    MemorySearchRequest,
+    MemoryUpdateRequest,
+    MemoryUpdateResponse,
     MemoryWriteRequest,
     MemoryWriteResponse,
     WriteResultItem,
-    MemoryEvent,
-    AsyncWriteRequest,
-    AsyncWriteResponse,
-    MemorySearchRequest,
-    ContextRequest,
-    MemoryUpdateRequest,
-    MemoryUpdateResponse,
-    MemoryDeleteRequest,
-    MemoryDeleteResponse,
 )
-from app.services.validation_service import validate_and_standardize
+from app.services.memory_pipeline import memory_pipeline
+from app.services.memory_store import memory_store
 from app.services.memory_service import (
-    get_memory_by_id,
-    update_memory_fields,
-    soft_delete_memory,
-    build_context_query,
-    list_memories_filtered,
-    get_stats,
-    get_memory_relations,
     get_user_profile,
     get_session_context,
     get_task_view,
+)
+from app.services.mq_producer import mq_producer
+from app.services.validation_service import (
+    validate_id_format,
+    normalize_id,
+    validate_write_request_by_type,
 )
 
 logger = get_logger("memory_api")
 router = APIRouter()
 
 
-# ============================================================
-# Mock 记忆抽取规则（联调期使用，正式期替换为下游模块调用）
-# ============================================================
-
-def _mock_extract_memories(messages: list, user_id: str) -> list[dict]:
-    """
-    Mock 记忆抽取规则。
-
-    联调期：简单规则模拟，保证前端流程跑通。
-    正式期：替换为等待下游"记忆生成+去重融合"模块的 RPC/MQ 回调结果。
-
-    规则：
-    - 检测到 "我叫xxx" / "我是xxx" → ADD（偏好/事实）
-    - 检测到 "不喜欢" / "讨厌" → ADD（偏好）
-    - 纯问候/确认消息 → SKIP
-    - 其他有价值的消息 → ADD（标记为一般记忆）
-    """
-    import re
-
-    results = []
-    for msg in messages:
-        content = msg.content.strip()
-        role = msg.role.lower()
-
-        # 跳过 system 消息
-        if role == "system":
-            results.append({"event": "SKIP", "memory": "", "id": ""})
-            continue
-
-        # 纯问候/短确认 → SKIP
-        greetings = {"你好", "hi", "hello", "ok", "好的", "收到", "明白了", "谢谢", "thanks", "嗯", "是的", "对"}
-        if content.lower() in greetings or len(content) <= 2:
-            results.append({
-                "id": "",
-                "memory": content,
-                "event": "SKIP",
-            })
-            continue
-
-        # 检测 "我叫xxx" / "我是xxx"
-        name_match = re.search(r"我(?:叫|是)([^，。,\.\s]+)", content)
-        if name_match:
-            name = name_match.group(1)
-            memory_text = f"用户名为{name}"
-            results.append({
-                "id": f"mem_{uuid4().hex[:16]}",
-                "memory": memory_text,
-                "event": "ADD",
-            })
-            continue
-
-        # 检测 "喜欢" / "偏好" / "擅长"
-        if re.search(r"喜欢|偏好|擅长|常用|习惯", content):
-            memory_text = f"用户偏好: {content[:80]}"
-            results.append({
-                "id": f"mem_{uuid4().hex[:16]}",
-                "memory": memory_text,
-                "event": "ADD",
-            })
-            continue
-
-        # 检测 "不喜欢" / "讨厌"
-        if re.search(r"不喜欢|讨厌|不想|拒绝", content):
-            memory_text = f"用户排斥: {content[:80]}"
-            results.append({
-                "id": f"mem_{uuid4().hex[:16]}",
-                "memory": memory_text,
-                "event": "ADD",
-            })
-            continue
-
-        # 检测 "做了xxx" / "完成了xxx" → 事实
-        if re.search(r"做了|完成了|已经|之前|上次|昨天|今天", content):
-            memory_text = f"相关事实: {content[:80]}"
-            results.append({
-                "id": f"mem_{uuid4().hex[:16]}",
-                "memory": memory_text,
-                "event": "ADD",
-            })
-            continue
-
-        # 一般有价值的消息 → ADD
-        results.append({
-            "id": f"mem_{uuid4().hex[:16]}",
-            "memory": content[:100],
-            "event": "ADD",
-        })
-
-    return results
+# Mock 提取器（从共享模块导入，供 memory.py 和 mq_consumer.py 共用）
+from app.services.mock_extractor import mock_extract_results as _mock_extract_results
 
 
 # ============================================================
@@ -161,116 +92,299 @@ def _mock_extract_memories(messages: list, user_id: str) -> list[dict]:
 async def memory_write(
     request: Request,
     body: MemoryWriteRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     agent_id: str = Depends(get_current_agent),
     user_id_header: str = Depends(get_current_user_id),
     scene_id: str | None = Depends(get_current_scene_id),
 ):
     """
-    同步写入对话记忆。
+    同步写入记忆数据，支持三种数据类型：
 
-    处理管线：
-    1. 鉴权（开发阶段跳过）
-    2. Pydantic 校验（messages 数组格式）
-    3. 逐条写入 t_interaction_record（原始记录）
-    4. Mock 记忆抽取 → 生成 results
-    5. 返回 {"code": 0, "data": {"results": [...]}}
+    - dialogue (对话记录): messages 数组逐条落库，每轮标记 turn_index
+    - session (历史会话): 导入历史会话内容、时间、来源信息
+    - task_process (任务过程): 写入任务目标、进展、执行结果
+
+    同步写入模式（由 settings.generation 控制）：
+    1. Mock 模式 (use_mock_extraction=True): 中文正则提取，<100ms 返回
+    2. MQ_Wait 模式 (use_mq_wait=True): 投递 Kafka → Redis 等待结果 → 伪同步返回
+    3. Direct Pipeline 模式: 直接调用 LLM Pipeline（5-15s）
+
+    延迟: Mock <100ms, MQ_Wait ~1-5s, Direct ~5-15s。
     """
     start = time_module.perf_counter()
+    itype = body.interaction_type
+    settings = get_settings()
 
     # 合并 ID 来源（Header > Body）
     effective_user_id = normalize_id(user_id_header or body.user_id)
     effective_scene_id = scene_id or body.scene_id
     effective_session_id = body.session_id or f"sess_{uuid4().hex[:12]}"
 
-    # --- 业务级校验（Pydantic 之上，补充 ID 格式等） ---
+    # 业务级校验（ID 格式 + 类型感知校验）
     if effective_user_id:
         err = validate_id_format("user_id", effective_user_id)
         if err:
             raise ValidationError(message=err)
 
-    # --- 写入原始交互记录（逐条落库，标记 processed=False） ---
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
+    # 类型感知校验：确保每种 interaction_type 有足够的输入数据
+    type_validation = validate_write_request_by_type(
+        interaction_type=itype,
+        messages=body.messages,
+        session_summary=body.session_summary,
+        session_time=body.session_time,
+        task_goal=body.task_goal,
+        task_progress=body.task_progress,
+        task_result=body.task_result,
+    )
+    type_validation.raise_if_invalid()
 
-    for i, msg in enumerate(body.messages):
-        record = InteractionRecord(
-            record_id=f"rec_{uuid4().hex[:24]}",
+    # --- 写入原始交互记录（批量 insert）---
+    await _batch_write_records(body, db, effective_user_id, agent_id,
+                                effective_scene_id, effective_session_id)
+    await db.commit()
+
+    # ============================================================
+    # 根据配置选择处理模式
+    # ============================================================
+
+    # 模式 1: Mock 提取（开发期，秒级返回）
+    if settings.generation.use_mock_extraction:
+        raw_results = _mock_extract_results(body.messages)
+        results = [
+            WriteResultItem(
+                id=r["id"],
+                memory=r["memory"],
+                event=MemoryEvent(r["event"]),
+            )
+            for r in raw_results
+        ]
+        elapsed = round((time_module.perf_counter() - start) * 1000, 2)
+        logger.info(
+            f"[Mock] 同步写入完成: type={itype}, user_id={effective_user_id}, "
+            f"messages={len(body.messages)}, "
+            f"results={len([r for r in raw_results if r['event'] == 'ADD'])}, "
+            f"elapsed={elapsed}ms"
+        )
+        return ok(MemoryWriteResponse(results=results).model_dump())
+
+    # 模式 2: MQ 等待（正式期伪同步，方案二）
+    if settings.generation.use_mq_wait:
+        request_id = f"mq_{uuid4().hex[:24]}"
+        body_dict = body.model_dump()
+
+        # 投递到 MQ
+        mq_ok = await _try_deliver_to_mq(
+            request_id, effective_user_id, agent_id, body_dict
+        )
+
+        if mq_ok:
+            # 等待 Consumer 处理结果（带超时降级）
+            from app.services.result_waiter import wait_for_result_with_timeout
+            raw_results = await wait_for_result_with_timeout(request_id)
+
+            results = [
+                WriteResultItem(
+                    id=r.get("id", ""),
+                    memory=r.get("memory", ""),
+                    event=MemoryEvent(r.get("event", "SKIP")),
+                )
+                for r in raw_results
+            ]
+            elapsed = round((time_module.perf_counter() - start) * 1000, 2)
+            logger.info(
+                f"[MQ_Wait] 同步写入完成: request_id={request_id}, "
+                f"elapsed={elapsed}ms"
+            )
+            return ok(MemoryWriteResponse(results=results).model_dump())
+        else:
+            logger.warning("MQ 不可用，降级到 Direct Pipeline")
+
+    # 模式 3: Direct Pipeline（默认，直接调用 LLM）
+    conversation_text = body.get_content_text()
+
+    try:
+        pipeline_result = await memory_pipeline.run(
+            text=conversation_text,
             user_id=effective_user_id,
             agent_id=agent_id,
             scene_id=effective_scene_id,
             session_id=effective_session_id,
             task_id=body.task_id,
-            turn_index=i,
-            role=msg.role,
-            content=msg.content,
-            content_type="text",
-            processed=False,
-            recorded_at=now,
-            extra_meta=body.metadata or {},
+            source_record_ids=None,
+            extraction_types=["key_fact", "task_state", "decision"],
+            task_context=body.metadata,
+            db=db,
         )
-        db.add(record)
-
-    await db.commit()
-
-    # --- 记忆生成：Pipeline（LLM 提取→生成→去重→存储），Mock 为降级 ---
-    from app.services.memory_pipeline import memory_pipeline as _pipeline
-    from app.core.config import get_settings
-
-    settings = get_settings()
-
-    if not settings.generation.use_mock_extraction:
-        # 正式路径：调用 LLM Pipeline
-        try:
-            text = body.get_content_text()
-            pipeline_result = await _pipeline.run(
-                text=text,
-                user_id=effective_user_id,
-                agent_id=agent_id,
-                scene_id=effective_scene_id,
-                session_id=effective_session_id,
-                task_id=body.task_id,
-                db=db,
-            )
-            results = [
+    except Exception as e:
+        logger.error(f"Pipeline execution failed: {e}")
+        return ok(MemoryWriteResponse(
+            results=[
                 WriteResultItem(
-                    id=d.get("memory_id", ""),
-                    memory=d.get("content_preview", ""),
-                    event=MemoryEvent.ADD if d.get("action") != "discard" else MemoryEvent.SKIP,
+                    id="",
+                    memory=m.content[:80] if hasattr(m, 'content') else "",
+                    event=MemoryEvent.SKIP,
                 )
-                for d in pipeline_result.details
+                for m in body.messages
             ]
-            logger.info(
-                f"[Pipeline] 同步写入完成: user_id={effective_user_id}, "
-                f"memories={pipeline_result.new_count + pipeline_result.merged_count}"
-            )
-        except Exception as e:
-            logger.error(f"Pipeline 失败，降级到 Mock: {e}")
-            mock_results = _mock_extract_memories(body.messages, effective_user_id)
-            results = [
-                WriteResultItem(id=r["id"], memory=r["memory"], event=MemoryEvent(r["event"]))
-                for r in mock_results
-            ]
-    else:
-        # 联调模式：Mock 正则提取
-        mock_results = _mock_extract_memories(body.messages, effective_user_id)
-        results = [
-            WriteResultItem(id=r["id"], memory=r["memory"], event=MemoryEvent(r["event"]))
-            for r in mock_results
-        ]
+        ).model_dump())
+
+    # --- 将 PipelineResult 映射为前端 results 格式 ---
+    results = _pipeline_to_write_results(pipeline_result)
 
     elapsed = round((time_module.perf_counter() - start) * 1000, 2)
     logger.info(
-        f"同步写入完成: user_id={effective_user_id}, "
-        f"messages={len(body.messages)}, results={len(results)}, "
-        f"elapsed={elapsed}ms"
+        f"[Pipeline] 同步写入完成: type={itype}, user_id={effective_user_id}, "
+        f"messages={len(body.messages)}, "
+        f"memories={pipeline_result.new_count + pipeline_result.merged_count}, "
+        f"discarded={pipeline_result.discarded_count}, elapsed={elapsed}ms"
     )
 
     return ok(MemoryWriteResponse(results=results).model_dump())
 
 
 # ============================================================
-# 异步写入 — 对齐前端对接文档
+# 写入辅助函数 — 批量 insert
+# ============================================================
+
+async def _batch_write_records(
+    body: MemoryWriteRequest, db, user_id: str, agent_id: str,
+    scene_id: str | None, session_id: str
+) -> None:
+    """批量写入交互记录（使用单条 INSERT ... VALUES 多条）"""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    itype = body.interaction_type
+    records = []
+
+    base = {
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "scene_id": scene_id,
+        "session_id": session_id,
+        "task_id": body.task_id,
+        "interaction_type": itype,
+        "content_type": "text",
+        "processed": False,
+        "status": "pending_extract",
+        "recorded_at": now,
+        "extra_meta": body.metadata or {},
+    }
+
+    extra = dict(body.metadata or {})
+
+    if itype == "dialogue":
+        for i, msg in enumerate(body.messages):
+            records.append({
+                **base,
+                "record_id": f"rec_{uuid4().hex[:24]}",
+                "turn_index": i,
+                "role": msg.role,
+                "content": msg.content,
+            })
+
+    elif itype == "session":
+        if body.session_time:
+            extra["session_time"] = body.session_time
+        if body.session_source:
+            extra["session_source"] = body.session_source
+        base["extra_meta"] = extra
+
+        for i, msg in enumerate(body.messages):
+            records.append({
+                **base,
+                "record_id": f"rec_{uuid4().hex[:24]}",
+                "turn_index": i,
+                "role": msg.role,
+                "content": msg.content,
+            })
+
+        if body.session_summary:
+            records.append({
+                **base,
+                "record_id": f"rec_{uuid4().hex[:24]}",
+                "turn_index": len(body.messages),
+                "role": "session_summary",
+                "content": body.session_summary,
+                "content_type": "session_summary",
+            })
+
+    elif itype == "task_process":
+        base["extra_meta"] = extra
+        for i, msg in enumerate(body.messages):
+            records.append({
+                **base,
+                "record_id": f"rec_{uuid4().hex[:24]}",
+                "turn_index": i,
+                "role": msg.role,
+                "content": msg.content,
+            })
+
+        turn_offset = len(body.messages)
+        task_fields = [
+            ("task_goal", body.task_goal),
+            ("task_progress", body.task_progress),
+            ("task_result", body.task_result),
+        ]
+        for j, (role_name, content) in enumerate(task_fields):
+            if content:
+                records.append({
+                    **base,
+                    "record_id": f"rec_{uuid4().hex[:24]}",
+                    "turn_index": turn_offset + j,
+                    "role": role_name,
+                    "content": content,
+                    "content_type": "task_process",
+                })
+
+    if records:
+        await db.execute(insert(InteractionRecord), records)
+
+
+# ============================================================
+# Pipeline 结果映射
+# ============================================================
+
+def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
+    """
+    将 PipelineResult.details 转换为前端 WriteResultItem 格式。
+
+    映射规则:
+      keep_new        → ADD     (新记忆创建)
+      merge           → MERGE   (合并到已有)
+      update_existing → ADD     (更新视为新增信息)
+      discard         → SKIP    (重复或不包含新信息)
+    """
+    results = []
+    for d in pipeline_result.details:
+        action = d.get("action", "keep_new")
+        memory_id = d.get("memory_id", "") or ""
+        content = d.get("content_preview", "") or ""
+
+        if action == "discard":
+            results.append(WriteResultItem(
+                id="",
+                memory=content,
+                event=MemoryEvent.SKIP,
+            ))
+        elif action == "merge":
+            results.append(WriteResultItem(
+                id=memory_id,
+                memory=content,
+                event=MemoryEvent.MERGE,
+            ))
+        else:  # keep_new / update_existing
+            results.append(WriteResultItem(
+                id=memory_id,
+                memory=content,
+                event=MemoryEvent.ADD,
+            ))
+
+    return results
+
+
+# ============================================================
+# 异步写入 — 对齐前端对接文档 一.1 附节
 # ============================================================
 
 @router.post("/async_write", summary="异步写入记忆", status_code=202)
@@ -283,18 +397,21 @@ async def memory_async_write(
     """
     异步写入 — 即刻返回 request_id，后台处理。
 
-    前端文档要求：异步接口直接返回 request_id。
+    处理管线:
+      1. 鉴权（开发阶段跳过）
+      2. 投递到 Kafka MQ
+      3. Consumer 异步处理 → 落库
+      4. 失败时降级为同步写入（status=pending_extract）
     """
     request_id = f"async_{uuid4().hex[:24]}"
-    effective_user_id = user_id_header or body.user_id
+    effective_user_id = normalize_id(user_id_header or body.user_id)
+    body_dict = body.model_dump()
 
-    # 尝试投递 MQ
-    mq_ok = await _try_deliver_to_mq(request_id, effective_user_id, body)
+    mq_ok = await _try_deliver_to_mq(request_id, effective_user_id, agent_id, body_dict)
 
     if mq_ok:
         logger.info(f"异步写入已投递 MQ: request_id={request_id}")
     else:
-        # 降级：同步写入
         logger.warning(f"MQ 不可用，降级同步写入: request_id={request_id}")
         await _fallback_sync_write(request_id, effective_user_id, agent_id, body)
 
@@ -304,84 +421,187 @@ async def memory_async_write(
     ).model_dump())
 
 
-async def _try_deliver_to_mq(request_id: str, user_id: str, body: AsyncWriteRequest) -> bool:
-    """尝试投递到 MQ。TODO: 角色B 实现 Kafka Producer"""
-    return False
+async def _try_deliver_to_mq(
+    request_id: str, user_id: str, agent_id: str, body_dict: dict
+) -> bool:
+    """尝试投递到 Kafka MQ。返回 True 投递成功，False 失败。"""
+    if not mq_producer.is_available:
+        logger.debug("MQ Producer 未初始化，跳过投递")
+        return False
+
+    return await mq_producer.publish_memory_write(
+        request_id=request_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        body_dict=body_dict,
+    )
 
 
 async def _fallback_sync_write(
     request_id: str, user_id: str, agent_id: str, body: AsyncWriteRequest
 ) -> None:
-    """MQ 不可用时降级为同步写入"""
+    """MQ 不可用时降级为同步写入原始记录（status=pending_extract，后续可补处理）"""
     from app.core.database import async_session_factory
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
+    itype = body.interaction_type
+    extra_meta = dict(body.metadata or {})
+
+    if itype == "session":
+        if body.session_time:
+            extra_meta["session_time"] = body.session_time
+        if body.session_source:
+            extra_meta["session_source"] = body.session_source
+
+    records = []
+    base = {
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "scene_id": body.scene_id,
+        "session_id": body.session_id or f"sess_{uuid4().hex[:12]}",
+        "task_id": body.task_id,
+        "interaction_type": itype,
+        "content_type": "text",
+        "processed": False,
+        "status": "pending_extract",
+        "recorded_at": now,
+        "extra_meta": extra_meta,
+    }
+
     async with async_session_factory() as session:
         for i, msg in enumerate(body.messages):
-            record = InteractionRecord(
-                record_id=f"rec_{uuid4().hex[:24]}",
-                user_id=user_id.strip().lower(),
-                agent_id=agent_id,
-                scene_id=body.scene_id,
-                session_id=body.session_id or f"sess_{uuid4().hex[:12]}",
-                task_id=body.task_id,
-                turn_index=i,
-                role=msg.role,
-                content=msg.content,
-                processed=False,
-                recorded_at=now,
-                extra_meta=body.metadata or {},
-            )
-            session.add(record)
+            records.append({
+                **base,
+                "record_id": f"rec_{uuid4().hex[:24]}",
+                "turn_index": i,
+                "role": msg.role,
+                "content": msg.content,
+            })
+
+        if itype == "session" and body.session_summary:
+            records.append({
+                **base,
+                "record_id": f"rec_{uuid4().hex[:24]}",
+                "turn_index": len(body.messages),
+                "role": "session_summary",
+                "content": body.session_summary,
+                "content_type": "session_summary",
+            })
+
+        if itype == "task_process":
+            turn_offset = len(body.messages)
+            task_fields = [
+                ("task_goal", body.task_goal),
+                ("task_progress", body.task_progress),
+                ("task_result", body.task_result),
+            ]
+            for j, (role_name, content) in enumerate(task_fields):
+                if content:
+                    records.append({
+                        **base,
+                        "record_id": f"rec_{uuid4().hex[:24]}",
+                        "turn_index": turn_offset + j,
+                        "role": role_name,
+                        "content": content,
+                        "content_type": "task_process",
+                    })
+
+        if records:
+            await session.execute(insert(InteractionRecord), records)
         await session.commit()
+
+    logger.info(
+        f"降级同步写入完成: request_id={request_id}, "
+        f"records={len(records)}, status=pending_extract"
+    )
 
 
 # ============================================================
 # 检索 — 对齐前端对接文档 一.2 节
 # ============================================================
 
-@router.post("/search", summary="检索记忆（本地多维过滤）")
+@router.post("/search", summary="检索记忆")
 async def memory_search(
     body: MemorySearchRequest,
     db: AsyncSession = Depends(get_db),
-    _agent: str = Depends(get_current_agent),
+    agent_id: str = Depends(get_current_agent),
 ):
-    """多维过滤检索 — 用户/场景/会话/任务/类型/时间/状态任意组合"""
-    from app.services.memory_service import search_local as local_search
-    filters = {
-        "user_id": body.user_id,
-        "agent_id": body.agent_id,
-        "scene_id": body.scene_id,
-        "session_id": body.session_id,
-        "task_id": body.task_id,
-        "memory_types": body.memory_types,
-        "time_start": body.time_start,
-        "time_end": body.time_end,
-        "include_inactive": body.include_inactive,
-    }
-    results = await local_search(db, filters)
-    items = [{
-        "memory_id": m.memory_id, "content": m.content, "summary": m.summary,
-        "memory_type": m.memory_type, "status": m.status,
-        "importance": m.importance, "confidence": m.confidence,
-        "tags": m.tags, "source_type": m.source_type,
-        "created_at": m.created_at.isoformat() if m.created_at else None,
-        "updated_at": m.updated_at.isoformat() if m.updated_at else None,
-    } for m in results[: body.top_k]]
-    return ok({"query": body.query, "results": items, "total": len(items)})
+    """
+    语义检索历史记忆 — Qdrant 向量检索 + PostgreSQL 元数据过滤。
+
+    返回与 query 最相关的记忆列表，包含 relevance_score。
+    当 Qdrant 不可用时，降级为数据库关键词匹配。
+    """
+    from app.services.retrieval_service import search as legacy_search
+
+    try:
+        result = await memory_store.search(
+                query=body.query,
+                user_id=body.user_id,
+                db=db,
+                agent_id=agent_id,
+                scene_id=body.scene_id,
+                task_id=body.task_id,
+                session_id=body.session_id,
+                memory_types=body.memory_types,
+                status=body.status,
+                max_content_length=body.max_content_length,
+                time_start=body.time_start,
+                time_end=body.time_end,
+                top_k=body.top_k,
+                rerank=body.rerank,
+            )
+        logger.info(
+            f"Search: user={body.user_id}, query='{body.query[:50]}...', "
+            f"found={len(result['results'])}, elapsed={result['elapsed_ms']}ms"
+        )
+        return ok(result)
+    except Exception as e:
+        logger.warning(f"MemoryStore search failed, falling back to legacy: {e}")
+        try:
+            result = legacy_search(
+                query=body.query,
+                user_id=body.user_id,
+                scene_id=body.scene_id,
+                task_id=body.task_id,
+                session_id=body.session_id,
+                memory_types=body.memory_types,
+                status=body.status,
+                max_content_length=body.max_content_length,
+                top_k=body.top_k,
+                rerank=body.rerank,
+            )
+            return ok(result)
+        except Exception as e2:
+            logger.error(f"Search failed (both paths): {e2}")
+            return error(
+                message="检索服务暂时不可用",
+                code=-1,
+                data={
+                    "query": body.query,
+                    "results": [],
+                    "total_candidates": 0,
+                    "elapsed_ms": 0,
+                },
+                error_code="SEARCH_FAILED",
+            )
 
 
-@router.post("/context", summary="Prompt 上下文片段")
+# ============================================================
+# 上下文 — 对齐前端对接文档 二.1 节
+# ============================================================
+
+@router.post("/context", summary="Prompt 上下文片段（三层聚合）")
 async def memory_context(
     body: ContextRequest,
     db: AsyncSession = Depends(get_db),
-    _agent: str = Depends(get_current_agent),
+    agent_id: str = Depends(get_current_agent),
 ):
     """
-    Prompt 上下文 — 三层聚合：
+    Prompt 上下文 — 层级感知聚合：
 
-    - 有 task_id   → get_task_view()    任务级：目标 + 进展时间线
+    - 有 task_id   → get_task_view()     任务级：当前目标 + 进展时间线
     - 有 session_id → get_session_context() 会话级：按类型分组 + 关键内容
     - 仅 user_id   → get_user_profile()    用户级：偏好 + 事实
     """
@@ -389,191 +609,210 @@ async def memory_context(
     formatted = ""
     memory_count = 0
 
-    if body.task_id:
-        # 任务级聚合
-        task_view = await get_task_view(db, body.task_id)
-        if task_view.get("current_goal"):
-            fragments.append({
-                "memory_type": "task_goal",
-                "content": task_view["current_goal"]["content"],
-                "memory_ids": [task_view["current_goal"]["memory_id"]],
-            })
-        for item in task_view.get("progress_timeline", []):
-            fragments.append({
-                "memory_type": f"task_{item.get('status', 'progress')}",
-                "content": item["content"],
-                "memory_ids": [item["memory_id"]],
-            })
-        memory_count = len(fragments)
-        formatted = "\n\n".join(
-            f"[任务记忆] {f['content']}" for f in fragments
-        )
-
-    elif body.session_id:
-        # 会话级聚合
-        sess_ctx = await get_session_context(db, body.session_id)
-        for mtype, items in sess_ctx.get("by_type", {}).items():
-            for item in items:
+    try:
+        if body.task_id:
+            task_view = await get_task_view(db, body.task_id)
+            if task_view.get("current_goal"):
                 fragments.append({
-                    "memory_type": mtype,
+                    "memory_type": "task_goal",
+                    "content": task_view["current_goal"]["content"],
+                    "memory_ids": [task_view["current_goal"]["memory_id"]],
+                })
+            for item in task_view.get("progress_timeline", []):
+                fragments.append({
+                    "memory_type": f"task_{item.get('status', 'progress')}",
                     "content": item["content"],
                     "memory_ids": [item["memory_id"]],
                 })
-        for item in sess_ctx.get("key_items", []):
-            fragments.append({
-                "memory_type": f"key_{item.get('memory_type', '')}",
-                "content": item["content"],
-                "memory_ids": [item["memory_id"]],
-                "key": True,
-            })
-        memory_count = len(fragments)
-        formatted = "\n\n".join(
-            f"[{f['memory_type']}] {f['content']}" for f in fragments
+            memory_count = len(fragments)
+            formatted = "\n\n".join(f"[任务记忆] {f['content']}" for f in fragments)
+
+        elif body.session_id:
+            sess_ctx = await get_session_context(db, body.session_id)
+            for mtype, items in sess_ctx.get("by_type", {}).items():
+                for item in items:
+                    fragments.append({
+                        "memory_type": mtype,
+                        "content": item["content"],
+                        "memory_ids": [item["memory_id"]],
+                    })
+            for item in sess_ctx.get("key_items", []):
+                fragments.append({
+                    "memory_type": f"key_{item.get('memory_type', '')}",
+                    "content": item["content"],
+                    "memory_ids": [item["memory_id"]],
+                    "key": True,
+                })
+            memory_count = len(fragments)
+            formatted = "\n\n".join(f"[{f['memory_type']}] {f['content']}" for f in fragments)
+
+        else:
+            profile = await get_user_profile(db, body.user_id)
+            for pref in profile.get("preferences", []):
+                fragments.append({"memory_type": "preference", "content": pref, "memory_ids": []})
+            for fact in profile.get("facts", []):
+                fragments.append({"memory_type": "fact", "content": fact, "memory_ids": []})
+            memory_count = len(fragments)
+
+            parts = []
+            if body.include_preferences and profile.get("preferences"):
+                parts.append("## 用户偏好\n" + "\n".join(f"- {p}" for p in profile["preferences"]))
+            if body.include_facts and profile.get("facts"):
+                parts.append("## 关键事实\n" + "\n".join(f"- {f}" for f in profile["facts"]))
+            formatted = "\n\n".join(parts)
+
+        return ok({
+            "fragments": fragments,
+            "formatted_text": formatted,
+            "memory_count": memory_count,
+            "estimated_tokens": len(formatted) // 2,
+        })
+    except Exception as e:
+        logger.error(f"Context generation failed: {e}")
+        return error(
+            message="上下文生成失败",
+            code=-2,
+            data={
+                "formatted_text": "",
+                "fragments": [],
+                "memory_count": 0,
+                "estimated_tokens": 0,
+            },
+            error_code="CONTEXT_FAILED",
         )
 
-    else:
-        # 用户级聚合
-        profile = await get_user_profile(db, body.user_id)
-        for pref in profile.get("preferences", []):
-            fragments.append({"memory_type": "preference", "content": pref, "memory_ids": []})
-        for fact in profile.get("facts", []):
-            fragments.append({"memory_type": "fact", "content": fact, "memory_ids": []})
-        memory_count = len(fragments)
 
-        parts = []
-        if body.include_preferences and profile.get("preferences"):
-            parts.append("## 用户偏好\n" + "\n".join(f"- {p}" for p in profile["preferences"]))
-        if body.include_facts and profile.get("facts"):
-            parts.append("## 关键事实\n" + "\n".join(f"- {f}" for f in profile["facts"]))
-        formatted = "\n\n".join(parts)
-
-    return ok({
-        "fragments": fragments,
-        "formatted_text": formatted,
-        "memory_count": memory_count,
-        "estimated_tokens": len(formatted) // 2,
-    })
+# ============================================================
+# 更新 — 对齐前端对接文档 二.2 节
+# ============================================================
 
 @router.put("/update", summary="更新记忆")
 async def memory_update(
     body: MemoryUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    _agent: str = Depends(get_current_agent),
 ):
-    updates = {k: v for k, v in body.model_dump(exclude={"memory_id"}, exclude_none=True).items() if v is not None}
-    memory = await update_memory_fields(db, body.memory_id, updates)
-    return ok({"memory_id": memory.memory_id, "updated": True, "version": memory.version})
+    """更新单条记忆的内容、重要性、标签等字段。"""
+    result = await memory_store.update_memory(
+        memory_id=body.memory_id,
+        db=db,
+        content=body.content,
+        summary=body.summary,
+        status=body.status,
+        importance=body.importance,
+        confidence=body.confidence,
+        tags=body.tags,
+    )
+    if result["updated"]:
+        return ok(MemoryUpdateResponse(
+            memory_id=body.memory_id,
+            updated=True,
+            version=result.get("version", 1),
+        ).model_dump())
+    else:
+        return ok(MemoryUpdateResponse(
+            memory_id=body.memory_id,
+            updated=False,
+            version=0,
+        ).model_dump())
 
+
+# ============================================================
+# 删除（软删除） — 对齐前端对接文档 二.3 节
+# ============================================================
 
 @router.delete("/delete", summary="删除记忆（软删除）")
 async def memory_delete(
     body: MemoryDeleteRequest,
     db: AsyncSession = Depends(get_db),
-    _agent: str = Depends(get_current_agent),
 ):
-    memory_id, previous_status = await soft_delete_memory(db, body.memory_id)
-    return ok({"memory_id": memory_id, "deleted": True, "previous_status": previous_status})
+    """软删除单条记忆（状态置为 deleted，从 Qdrant 移除向量）。"""
+    result = await memory_store.soft_delete(
+        memory_id=body.memory_id,
+        db=db,
+        reason=body.reason,
+    )
+    return ok(MemoryDeleteResponse(
+        memory_id=body.memory_id,
+        deleted=result["deleted"],
+        previous_status=result.get("previous_status", "active"),
+    ).model_dump())
 
 
-@router.get("/list", summary="多维度过滤查询")
-async def memory_list_filtered(
+# ============================================================
+# 列出全部 — 对齐前端对接文档 一.3 节
+# ============================================================
+
+@router.post("/list", summary="列出全部记忆")
+async def memory_list(
     user_id: str = Query(...),
-    scene_id: str = Query(None),
-    session_id: str = Query(None),
-    task_id: str = Query(None),
-    memory_type: str = Query(None),
-    status: str = Query(None),
-    time_start: str = Query(None),
-    time_end: str = Query(None),
+    scene_id: str | None = Query(None),
+    task_id: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    _agent: str = Depends(get_current_agent),
 ):
-    from datetime import datetime as dt
-    filters = {"user_id": user_id}
-    if scene_id: filters["scene_id"] = scene_id
-    if session_id: filters["session_id"] = session_id
-    if task_id: filters["task_id"] = task_id
-    if memory_type: filters["memory_types"] = [memory_type]
-    if status: filters["status"] = status
-    if time_start: filters["time_start"] = dt.fromisoformat(time_start)
-    if time_end: filters["time_end"] = dt.fromisoformat(time_end)
-    items, total = await list_memories_filtered(db, filters, page, page_size)
-    return ok({"items": [_memory_to_dict(m) for m in items], "total": total, "page": page, "page_size": page_size})
+    """
+    分页列出用户全部记忆。
 
+    优先使用 MemoryStore 直查 PostgreSQL；
+    MemoryStore 查询为空时降级到 MCP 路径。
+    """
+    try:
+        result = await memory_store.list_memories(
+            user_id=user_id,
+            db=db,
+            scene_id=scene_id,
+            task_id=task_id,
+            page=page,
+            page_size=page_size,
+        )
 
-@router.get("/stats", summary="记忆统计")
-async def memory_stats(
-    db: AsyncSession = Depends(get_db),
-    _agent: str = Depends(get_current_agent),
-):
-    stats = await get_stats(db)
-    return ok(stats)
+        if result["total"] > 0:
+            return ok(result)
 
+        logger.info(f"MemoryStore empty for user={user_id}, falling back to MCP")
+        from app.mcp_client import mcp_client
+        mcp_result = await mcp_client.list_memories(user_id=user_id)
+        return ok(mcp_result)
 
-@router.get("/{memory_id}", summary="查询单条记忆")
-async def memory_get(
-    memory_id: str,
-    db: AsyncSession = Depends(get_db),
-    _agent: str = Depends(get_current_agent),
-):
-    memory = await get_memory_by_id(db, memory_id)
-    if not memory:
-        from app.core.exceptions import NotFoundError
-        raise NotFoundError(f"记忆 {memory_id} 不存在")
-    return ok({
-        "memory_id": memory.memory_id,
-        "content": memory.content,
-        "summary": memory.summary,
-        "key_points": memory.key_points,
-        "memory_type": memory.memory_type,
-        "status": memory.status,
-        "importance": memory.importance,
-        "confidence": memory.confidence,
-        "tags": memory.tags,
-        "user_id": memory.user_id,
-        "agent_id": memory.agent_id,
-        "scene_id": memory.scene_id,
-        "session_id": memory.session_id,
-        "task_id": memory.task_id,
-        "version": memory.version,
-        "created_at": memory.created_at.isoformat() if memory.created_at else None,
-        "updated_at": memory.updated_at.isoformat() if memory.updated_at else None,
-    })
-
-
-@router.get("/{memory_id}/relations", summary="查询记忆关系")
-async def memory_relations(
-    memory_id: str,
-    db: AsyncSession = Depends(get_db),
-    _agent: str = Depends(get_current_agent),
-):
-    relations = await get_memory_relations(db, memory_id)
-    return ok({"memory_id": memory_id, "relations": relations})
+    except Exception as e:
+        logger.error(f"List failed: {e}")
+        from app.mcp_client import mcp_client
+        try:
+            mcp_result = await mcp_client.list_memories(user_id=user_id)
+            return ok(mcp_result)
+        except Exception:
+            return ok({"items": [], "total": 0, "page": page, "page_size": page_size})
 
 
 # ============================================================
-# MCP 工具直通接口 — 测试用
+# 清除全部 — 对齐前端对接文档 一.4 节
 # ============================================================
-
-def _memory_to_dict(m) -> dict:
-    return {"memory_id":m.memory_id,"content":m.content,"summary":m.summary,
-            "key_points":m.key_points,"memory_type":m.memory_type,"status":m.status,
-            "importance":m.importance,"confidence":m.confidence,"tags":m.tags,
-            "user_id":m.user_id,"agent_id":m.agent_id,"scene_id":m.scene_id,
-            "session_id":m.session_id,"task_id":m.task_id,"version":m.version,
-            "created_at":m.created_at.isoformat() if m.created_at else None,
-            "updated_at":m.updated_at.isoformat() if m.updated_at else None}
-
-
-@router.post("/list", summary="列出全部记忆（MCP）")
-async def memory_list(user_id: str = Query(...)):
-    result = await mcp_client.list_memories(user_id=user_id)
-    return ok(result)
-
 
 @router.post("/delete-all", summary="清除全部记忆")
-async def memory_delete_all(user_id: str = Query(...)):
-    result = await mcp_client.delete_all_memories(user_id=user_id)
-    return ok(result)
+async def memory_delete_all(
+    user_id: str = Query(...),
+    scene_id: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    清除用户全部记忆 — PostgreSQL + Qdrant 双清。
+    同时清理 MCP/mem0 中的记忆（如果可用）。
+    """
+    store_result = await memory_store.delete_all_memories(
+        user_id=user_id,
+        db=db,
+        scene_id=scene_id,
+    )
+
+    try:
+        from app.mcp_client import mcp_client
+        await mcp_client.delete_all_memories(user_id=user_id)
+        logger.info(f"MCP memories also cleared for user={user_id}")
+    except Exception as e:
+        logger.warning(f"MCP delete-all failed (non-fatal): {e}")
+
+    return ok({
+        "message": store_result["message"],
+        "deleted_count": store_result["deleted_count"],
+    })

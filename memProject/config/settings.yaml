@@ -56,6 +56,22 @@ mem0:
       api_key: "${SILICONFLOW_API_KEY}"
       openai_base_url: "https://api.siliconflow.cn/v1"
 
+# Kafka 消息队列配置
+kafka:
+  bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}"
+  topic_memory_write: "memory.write"
+  topic_memory_result: "memory.result"
+  topic_memory_dlq: "memory.dlq"
+  consumer_group: "memory-system"
+  max_retries: 3
+  retry_backoff_ms: 1000
+
+# Redis 配置（伪同步结果回调）
+redis:
+  url: "${REDIS_URL:-redis://localhost:6379/0}"
+  result_ttl: 300
+  result_poll_timeout: 5.0
+
 # 检索配置
 retrieval:
   default_top_k: 10
@@ -65,6 +81,7 @@ retrieval:
   recency_weight: 0.15
   importance_weight: 0.15
   confidence_weight: 0.1
+  enable_rerank: true
 
 # 记忆生成配置
 generation:
@@ -72,6 +89,8 @@ generation:
   schedule_interval_minutes: 5
   max_memory_text_length: 2000
   max_summary_length: 500
+  use_mock_extraction: true
+  use_mq_wait: false
 
 # 记忆压缩配置
 compression:

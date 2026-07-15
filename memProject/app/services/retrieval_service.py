@@ -14,6 +14,15 @@ settings = get_settings()
 logger = get_logger("retrieval")
 
 
+def _truncate_text(text: str, max_length: Optional[int]) -> str:
+    """截断文本到指定长度，超出时追加省略号。"""
+    if not max_length or max_length <= 0:
+        return text
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + "..."
+
+
 def build_filters(
     user_id: str,
     agent_id: Optional[str] = None,
@@ -42,9 +51,14 @@ def _post_filter(
     task_id: Optional[str] = None,
     memory_types: Optional[list[str]] = None,
     include_inactive: bool = False,
+    status: Optional[list[str]] = None,
     keyword: Optional[str] = None,
 ) -> list[dict]:
-    """mem0 返回后，按 metadata + 关键词 筛选"""
+    """mem0 返回后，按 metadata + 关键词 筛选。
+
+    status 优先于 include_inactive：传 status 则按列表精确匹配，
+    不传则回退到 include_inactive 行为（False=只查 active）。
+    """
     filtered = []
     for item in items:
         meta = item.get("metadata", {}) or {}
@@ -54,7 +68,12 @@ def _post_filter(
             continue
         if memory_types and meta.get("memory_type") not in memory_types:
             continue
-        if not include_inactive and meta.get("status") == "deleted":
+        # 状态筛选：status 优先，回退到 include_inactive
+        item_status = meta.get("status", "active")
+        if status is not None:
+            if item_status not in status:
+                continue
+        elif not include_inactive and item_status == "deleted":
             continue
         if keyword:
             content = item.get("memory", "").lower()
@@ -73,12 +92,15 @@ def search(
     session_id: Optional[str] = None,
     task_id: Optional[str] = None,
     memory_types: Optional[list[str]] = None,
+    status: Optional[list[str]] = None,
+    max_content_length: Optional[int] = None,
     time_start: Optional[str] = None,
     time_end: Optional[str] = None,
     top_k: int = 10,
     include_inactive: bool = False,
     include_scores: bool = True,
-    rerank: bool = False,
+    rerank: bool = True,
+    keyword: Optional[str] = None,
 ) -> dict:
     """多信号融合检索：mem0混合搜索 + 应用层后过滤"""
     start = time.perf_counter()
@@ -106,7 +128,7 @@ def search(
         all_items,
         scene_id=scene_id, task_id=task_id,
         memory_types=memory_types, include_inactive=include_inactive,
-        keyword=None,
+        status=status, keyword=keyword,
     )
     filtered_total = len(filtered)
     filtered = filtered[:top_k]
@@ -118,7 +140,7 @@ def search(
         meta = item.get("metadata", {}) or {}
         results.append({
             "memory_id": item.get("id", ""),
-            "content": item.get("memory", ""),
+            "content": _truncate_text(item.get("memory", ""), max_content_length),
             "memory_type": meta.get("memory_type", "unknown"),
             "status": meta.get("status", "active"),
             "relevance_score": item.get("score") if include_scores else None,

@@ -57,7 +57,7 @@ async def get_current_agent(
             or request.headers.get("X-API-Key")  # 即使不校验，也尝试提取
             or DEFAULT_DEV_AGENT_ID
         )
-        dev_scene = request.headers.get("X-Scene-Id") or DEFAULT_DEV_SCENE_ID
+        dev_scene = request.headers.get("X-Scene-Id") or None  # 无Header时让Body生效
 
         request.state.agent_id = dev_agent
         request.state.scene_id = dev_scene

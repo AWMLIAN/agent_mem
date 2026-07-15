@@ -39,3 +39,7 @@ Thumbs.db
 
 # Alembic
 alembic/versions/*.pyc
+
+# Test data (not committed)
+tests/_last_uid.txt
+continue_zh.jsonl

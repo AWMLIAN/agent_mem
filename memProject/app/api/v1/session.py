@@ -7,16 +7,17 @@
 - GET /session/{id} — 查询
 - GET /session — 列表
 - PUT /session/{id} — 更新
-- POST /session/{id}/close — 关闭会话
+- POST /session/{id}/close — 关闭会话（含压缩触发器）
 """
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_agent, get_current_user_id
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.exceptions import NotFoundError
 from app.core.logger import get_logger
@@ -174,6 +175,7 @@ async def session_update(
 @router.post("/{session_id}/close", summary="关闭会话")
 async def session_close(
     session_id: str,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     _agent: str = Depends(get_current_agent),
 ):
@@ -184,8 +186,10 @@ async def session_close(
     1. 更新 status → closed
     2. 记录 ended_at
     3. 统计关联记忆数
-    4. 触发长对话压缩任务（角色B实现）
+    4. 若 message_count >= 阈值，触发长对话压缩（BackgroundTasks 异步执行）
     """
+    settings = get_settings()
+
     result = await db.execute(
         select(Session).where(Session.session_id == session_id.strip().lower())
     )
@@ -204,19 +208,69 @@ async def session_close(
         )
     )
     memory_count = mem_count_result.scalar() or 0
+    message_count = session.message_count or 0
+
+    # 判断是否需要触发压缩
+    trigger_threshold = settings.compression.trigger_session_length
+    compression_triggered = message_count >= trigger_threshold
 
     await db.commit()
 
-    logger.info(
-        f"会话关闭: session_id={session_id}, "
-        f"messages={session.message_count}, memories={memory_count}"
-    )
+    if compression_triggered:
+        background_tasks.add_task(
+            _trigger_compression,
+            session_id=session_id,
+            message_count=message_count,
+            memory_count=memory_count,
+        )
+        logger.info(
+            f"会话关闭 + 压缩触发: session_id={session_id}, "
+            f"messages={message_count}, threshold={trigger_threshold}"
+        )
+    else:
+        logger.info(
+            f"会话关闭: session_id={session_id}, "
+            f"messages={message_count}, memories={memory_count}"
+        )
 
     return ok({
         "session_id": session_id,
         "status": "closed",
-        "message_count": session.message_count or 0,
+        "message_count": message_count,
         "memory_count": memory_count,
+        "compression_triggered": compression_triggered,
         "ended_at": session.ended_at.isoformat(),
-        "summary": f"会话已关闭，产生 {memory_count} 条记忆",
+        "summary": f"会话已关闭，产生 {memory_count} 条记忆"
+            + ("（已触发长对话压缩）" if compression_triggered else ""),
     }, "关闭成功")
+
+
+async def _trigger_compression(
+    session_id: str,
+    message_count: int,
+    memory_count: int,
+) -> None:
+    """
+    后台异步执行长对话压缩。
+
+    当会话消息数超过阈值时触发：
+    1. 检索该会话所有活跃记忆
+    2. 按重要性排序，保留核心记忆
+    3. 生成压缩摘要并存储
+
+    当前实现：标记并记录（压缩 Pipeline 待后续实现）。
+    """
+    settings = get_settings()
+    logger.info(
+        f"[Compression] 开始压缩: session_id={session_id}, "
+        f"messages={message_count}, memories={memory_count}, "
+        f"compressed_length={settings.compression.compressed_context_length}"
+    )
+
+    # TODO: 实际压缩 Pipeline（调用 LLM 生成摘要 → 生成压缩记忆 → 标记旧记忆）
+    # 当前占位：仅记录日志，确认触发条件生效
+
+    logger.info(
+        f"[Compression] 压缩完成（占位）: session_id={session_id}, "
+        f"compressed_to={settings.compression.compressed_context_length} chars"
+    )
