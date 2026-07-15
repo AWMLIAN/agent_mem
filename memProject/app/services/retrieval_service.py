@@ -100,6 +100,7 @@ def search(
     include_inactive: bool = False,
     include_scores: bool = True,
     rerank: bool = True,
+    keyword: Optional[str] = None,
 ) -> dict:
     """多信号融合检索：mem0混合搜索 + 应用层后过滤"""
     start = time.perf_counter()
@@ -127,7 +128,7 @@ def search(
         all_items,
         scene_id=scene_id, task_id=task_id,
         memory_types=memory_types, include_inactive=include_inactive,
-        status=status, keyword=None,
+        status=status, keyword=keyword,
     )
     filtered_total = len(filtered)
     filtered = filtered[:top_k]
