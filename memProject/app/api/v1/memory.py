@@ -783,6 +783,25 @@ async def memory_context(
             elapsed_ms=0,
         ))
 
+        # LLM 总结：用结构化摘要替换原始拼接
+        total_frags = len(result.get("fragments", []))
+        result["memory_count"] = total_frags
+        if total_frags > 0:
+            try:
+                from app.services.llm_client import llm_client as _llm
+                contents = "\n".join(
+                    f"- [{f['memory_type']}] {f['content'][:200]}"
+                    for f in result["fragments"][:20]
+                )
+                summary = await _llm.chat_completion([{
+                    "role": "user",
+                    "content": f"将以下记忆碎片总结为一段通顺的摘要，注入AI对话上下文。保留关键信息，去除冗余：\n{contents}"
+                }], max_tokens=body.max_tokens or 500)
+                result["formatted_text"] = summary
+                result["estimated_tokens"] = len(summary) // 2
+            except Exception:
+                pass
+
         return ok(result)
     except Exception as e:
         logger.error(f"Context generation failed: {e}")
