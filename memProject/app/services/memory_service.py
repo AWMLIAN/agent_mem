@@ -75,23 +75,67 @@ async def create_memory(db: AsyncSession, data: dict) -> Memory:
 
 
 async def _create_preference(db: AsyncSession, data: dict) -> Memory:
-    """偏好管理：新偏好替换旧偏好，旧标记 pending_update。"""
+    """偏好管理：基于 Embedding 语义相似度判断是否同一方面，替换旧偏好。"""
     user_id = data.get("user_id")
+    new_id = data.get("memory_id", "")
+    new_content = data.get("content", "")
+    replaced = 0
+    if user_id:
+        old = await search_local(db, {
+            "user_id": user_id, "memory_types": ["preference"], "status": "active",
+        })
+        if old:
+            try:
+                from app.services.embedding_client import embedding_client as _emb
+                new_vec = await _emb.embed_single(new_content)
+                for m in old:
+                    old_vec = await _emb.embed_single(m.content or "")
+                    if not old_vec:
+                        continue
+                    similarity = _cosine_sim(new_vec, old_vec)
+                    if similarity >= 0.8:
+                        m.status = "pending_update"
+                        m.replaced_by = new_id
+                        m.updated_at = _now()
+                        replaced += 1
+                if replaced:
+                    logger.info(f"用户 {user_id} 同一方面旧偏好 {replaced}/{len(old)} 条替换")
+                else:
+                    logger.info(f"用户 {user_id} 无同方面旧偏好，新偏好直接追加")
+            except Exception as e:
+                logger.warning(f"Embedding 不可用，降级为关键词判断: {e}")
+                return await _create_preference_keyword(db, data)
+        else:
+            return await _insert_memory(db, data)
+
+    return await _insert_memory(db, data)
+
+
+async def _create_preference_keyword(db: AsyncSession, data: dict) -> Memory:
+    """关键词去重（Embedding 不可用时的降级方案）。"""
+    import re as _re
+    user_id = data.get("user_id")
+    new_id = data.get("memory_id", "")
+    new_content = data.get("content", "")
+    new_words = set(_re.findall(r'[一-鿿]+|[a-zA-Z]+', new_content.lower()))
+    replaced = 0
     if user_id:
         old = await search_local(db, {
             "user_id": user_id, "memory_types": ["preference"], "status": "active",
         })
         for m in old:
-            m.status = "pending_update"
-            m.updated_at = _now()
-        if old:
-            logger.info(f"用户 {user_id} 旧偏好 {len(old)} 条标记为 pending_update")
-
+            old_words = set(_re.findall(r'[一-鿿]+|[a-zA-Z]+', (m.content or "").lower()))
+            shared = new_words & old_words
+            if len(shared) >= 2:
+                m.status = "pending_update"
+                m.replaced_by = new_id
+                m.updated_at = _now()
+                replaced += 1
     return await _insert_memory(db, data)
 
 
 async def _create_fact(db: AsyncSession, data: dict) -> Memory:
-    """事实管理：简单内容去重 + 冲突检测。"""
+    """事实管理：基于 Embedding 语义相似度去重 + 冲突检测。"""
     content = data.get("content", "")
     user_id = data.get("user_id")
 
@@ -99,17 +143,55 @@ async def _create_fact(db: AsyncSession, data: dict) -> Memory:
         existing = await search_local(db, {
             "user_id": user_id, "memory_types": ["fact"], "status": "active",
         })
+        if existing:
+            try:
+                from app.services.embedding_client import embedding_client as _emb
+                new_vec = await _emb.embed_single(content)
+                for m in existing:
+                    old_vec = await _emb.embed_single(m.content or "")
+                    if not old_vec:
+                        continue
+                    similarity = _cosine_sim(new_vec, old_vec)
+                    if similarity > 0.95:
+                        logger.info(f"事实去重：与 {m.memory_id} 语义相似度 {similarity:.2f}，跳过")
+                        m.use_count = (m.use_count or 0) + 1
+                        return m
+                    elif similarity >= 0.85:
+                        data["status"] = "conflict"
+                        data["replaced_by"] = m.memory_id
+                        logger.info(f"事实冲突标记：与 {m.memory_id} 语义相似度 {similarity:.2f}")
+            except Exception as e:
+                logger.warning(f"Embedding 不可用，降级为关键词判断: {e}")
+                return await _create_fact_keyword(db, data)
+
+    return await _insert_memory(db, data)
+
+
+async def _create_fact_keyword(db: AsyncSession, data: dict) -> Memory:
+    """关键词去重（Embedding 不可用时的降级方案）。"""
+    content = data.get("content", "")
+    user_id = data.get("user_id")
+    if user_id and len(content) > 5:
+        existing = await search_local(db, {
+            "user_id": user_id, "memory_types": ["fact"], "status": "active",
+        })
         for m in existing:
             overlap = _content_overlap(content, m.content or "")
             if overlap > 0.9:
-                logger.info(f"事实去重：与 {m.memory_id} 相似度 {overlap:.2f}，跳过")
                 m.use_count = (m.use_count or 0) + 1
                 return m
             elif overlap >= 0.5:
                 data["status"] = "conflict"
-                logger.info(f"事实冲突标记：与 {m.memory_id} 相似度 {overlap:.2f}")
-
+                data["replaced_by"] = m.memory_id
     return await _insert_memory(db, data)
+
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """两个向量的余弦相似度。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
 
 # 任务目标关键词 — 命中则视为"目标/诉求"类记忆，走新旧更替逻辑
@@ -173,6 +255,7 @@ async def _insert_memory(db: AsyncSession, data: dict) -> Memory:
         entities=data.get("entities", []),
         status=data.get("status", "active"),
         version=data.get("version", 1),
+        replaced_by=data.get("replaced_by"),
         importance=data.get("importance", 0.5),
         confidence=data.get("confidence", 0.5),
         source_type=data.get("source_type", "extracted"),
