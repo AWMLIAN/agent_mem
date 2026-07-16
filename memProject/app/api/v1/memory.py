@@ -29,6 +29,7 @@
 import asyncio
 import re as re_module
 import time as time_module
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
@@ -43,10 +44,10 @@ from app.api.deps import (
     get_current_task_id,
 )
 from app.core.config import get_settings
-from app.core.database import get_db
+from app.core.database import async_session_factory, get_db
+from app.models.base import InteractionRecord, RetrievalRequest, RetrievalResult
 from app.core.exceptions import ValidationError
 from app.core.logger import get_logger
-from app.models.base import InteractionRecord
 from app.schemas.common import error, ok
 from app.schemas.memory import (
     AsyncWriteRequest,
@@ -78,6 +79,52 @@ from app.services.validation_service import (
 
 logger = get_logger("memory_api")
 router = APIRouter()
+
+
+# ============================================================
+# Fire-and-Forget 检索日志（写 t_retrieval_request + t_retrieval_result）
+# ============================================================
+
+async def _log_retrieval(
+    request_id: str,
+    agent_id: Optional[str],
+    user_id: str,
+    scene_id: Optional[str],
+    session_id: Optional[str],
+    task_id: Optional[str],
+    query_text: str,
+    filter_conditions: dict,
+    top_k: int,
+    results: list[dict],
+    elapsed_ms: int,
+):
+    """异步写检索日志，失败不阻塞主流程。"""
+    try:
+        async with async_session_factory() as log_db:
+            log_db.add(RetrievalRequest(
+                request_id=request_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                scene_id=scene_id,
+                session_id=session_id,
+                task_id=task_id,
+                query_text=query_text,
+                filter_conditions=filter_conditions,
+                top_k=top_k,
+            ))
+            await log_db.flush()
+
+            for rank, mem in enumerate(results):
+                log_db.add(RetrievalResult(
+                    request_id=request_id,
+                    memory_id=mem.get("memory_id", ""),
+                    rank=rank,
+                    relevance_score=mem.get("relevance_score"),
+                ))
+
+            await log_db.commit()
+    except Exception as e:
+        logger.warning(f"Retrieval log write failed (non-fatal): {e}")
 
 
 # Mock 提取器（从共享模块导入，供 memory.py 和 mq_consumer.py 共用）
@@ -564,6 +611,28 @@ async def memory_search(
             f"Search: user={body.user_id}, query='{body.query[:50]}...', "
             f"found={len(result['results'])}, elapsed={result['elapsed_ms']}ms"
         )
+
+        # Fire-and-forget 检索日志
+        req_id = str(uuid4())
+        asyncio.create_task(_log_retrieval(
+            request_id=req_id,
+            agent_id=agent_id,
+            user_id=body.user_id,
+            scene_id=body.scene_id,
+            session_id=body.session_id,
+            task_id=body.task_id,
+            query_text=body.query,
+            filter_conditions={
+                "memory_types": body.memory_types,
+                "status": body.status,
+                "time_start": str(body.time_start) if body.time_start else None,
+                "time_end": str(body.time_end) if body.time_end else None,
+            },
+            top_k=body.top_k,
+            results=result.get("results", []),
+            elapsed_ms=result.get("elapsed_ms", 0),
+        ))
+
         return ok(result)
     except Exception as e:
         logger.warning(f"MemoryStore search failed, falling back to legacy: {e}")
@@ -632,6 +701,7 @@ async def memory_context(
             include_facts=body.include_facts,
             include_task_state=body.include_task_state,
         )
+        import logging as _lg; _lg.warning(f"DEBUG: get_context memory_count={result.get('memory_count')}, fragments={len(result.get('fragments', []))}, top_k={body.top_k}")
 
         # 增强层：叠加上下文聚合（任务级/会话级/用户级）
         if body.task_id:
@@ -672,7 +742,28 @@ async def memory_context(
                         "memory_type": "fact", "content": fact, "memory_ids": []
                     })
 
-        result["memory_count"] = len(result.get("fragments", []))
+        # Fire-and-forget 检索日志（仅记录基础层检索结果，不含增强层）
+        req_id = str(uuid4())
+        asyncio.create_task(_log_retrieval(
+            request_id=req_id,
+            agent_id=agent_id,
+            user_id=body.user_id,
+            scene_id=body.scene_id,
+            session_id=body.session_id,
+            task_id=body.task_id,
+            query_text=body.query,
+            filter_conditions={
+                "memory_types": body.memory_types,
+                "status": body.status,
+                "top_k": body.top_k,
+                "max_content_length": body.max_content_length,
+                "group_by_type": body.group_by_type,
+            },
+            top_k=body.top_k,
+            results=result.get("fragments", []),
+            elapsed_ms=0,
+        ))
+
         return ok(result)
     except Exception as e:
         logger.error(f"Context generation failed: {e}")
