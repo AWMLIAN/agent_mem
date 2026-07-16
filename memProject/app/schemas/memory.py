@@ -201,9 +201,7 @@ class MemorySearchRequest(BaseModel):
     task_id: Optional[str] = Field(None)
     session_id: Optional[str] = Field(None)
     memory_types: Optional[list[str]] = Field(None, description="筛选类型: preference/fact/task/decision/constraint")
-    status: Optional[list[str]] = Field(None, description="筛选状态: active/archived/deleted，不传默认只查 active")
     top_k: int = Field(default=10, ge=1, le=50)
-    max_content_length: Optional[int] = Field(default=None, ge=1, le=5000, description="单条 content 最大字符数，超出截断；不传不截断")
     time_start: Optional[datetime] = Field(None)
     time_end: Optional[datetime] = Field(None)
     include_scores: bool = Field(default=True)
@@ -221,17 +219,8 @@ class ContextRequest(BaseModel):
     scene_id: Optional[str] = Field(None)
     task_id: Optional[str] = Field(None)
     session_id: Optional[str] = Field(None)
-    max_tokens: int = Field(default=3000, ge=1, le=32000)
+    max_tokens: int = Field(default=3000)
     group_by_type: bool = Field(default=True)
-    # 返回条数控制 — 暴露给前端，替代硬编码 20
-    top_k: int = Field(default=20, ge=1, le=50)
-    # 单条长度控制 — /context 默认 200，保持格式化截断行为
-    max_content_length: Optional[int] = Field(default=200, ge=1, le=5000, description="单条 content 最大字符数，超出截断")
-    # 精确类型筛选 — 传此参数时覆盖 include_* 布尔
-    memory_types: Optional[list[str]] = Field(None, description="精确筛选类型: preference/fact/task_state/decision/constraint/process")
-    # 状态筛选 — 不传默认只查 active
-    status: Optional[list[str]] = Field(None, description="筛选状态: active/archived/deleted")
-    # 旧: 粗粒度布尔（保留向前兼容）
     include_preferences: bool = Field(default=True)
     include_facts: bool = Field(default=True)
     include_task_state: bool = Field(default=True)
@@ -252,21 +241,21 @@ class MemoryUpdateRequest(BaseModel):
     tags: Optional[list[str]] = Field(None)
 
 
+class MemoryUpdateResponse(BaseModel):
+    """更新响应"""
+    memory_id: str
+    updated: bool = True
+    version: int = 1
+
+
 class MemoryDeleteRequest(BaseModel):
     """删除记忆请求（软删除）"""
     memory_id: str = Field(..., description="记忆唯一标识")
     reason: Optional[str] = Field(None)
 
 
-class MemoryUpdateResponse(BaseModel):
-    """更新记忆响应"""
-    memory_id: str = Field(..., description="记忆 ID")
-    updated: bool = Field(..., description="是否更新成功")
-    version: int = Field(default=0, description="更新后版本号")
-
-
 class MemoryDeleteResponse(BaseModel):
-    """删除记忆响应"""
-    memory_id: str = Field(..., description="记忆 ID")
-    deleted: bool = Field(..., description="是否删除成功")
-    previous_status: str = Field(default="active", description="删除前状态")
+    """删除响应"""
+    memory_id: str
+    deleted: bool = True
+    previous_status: str = "active"

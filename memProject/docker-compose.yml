@@ -2,103 +2,30 @@
 # 智能体记忆系统 — 开发环境（按需启动）
 #
 #   docker compose up -d                  # PG + Qdrant
-#   docker compose --profile mq up -d     # + Kafka + Redis
 #   docker compose --profile gpu up -d    # + Ollama
-#   docker compose --profile full up -d   # 全部服务
 # ============================================================
 
 services:
-  # ---- PostgreSQL + pgvector ----
   postgres:
+    platform: linux/amd64
     image: pgvector/pgvector:pg16
-    container_name: mem-postgres
     environment:
-      POSTGRES_USER: memuser
-      POSTGRES_PASSWORD: mempassword
-      POSTGRES_DB: agent_memory
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mem_db
     ports:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-    restart: unless-stopped
 
-  # ---- Qdrant 向量数据库 ----
   qdrant:
+    platform: linux/amd64
     image: qdrant/qdrant:latest
-    container_name: mem-qdrant
     ports:
       - "6333:6333"
-      - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
-    restart: unless-stopped
-
-  # ---- Zookeeper（Kafka 依赖）----
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    container_name: mem-zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
-    restart: unless-stopped
-    profiles:
-      - mq
-      - full
-
-  # ---- Kafka 消息队列 ----
-  kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    container_name: mem-kafka
-    depends_on:
-      - zookeeper
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-    ports:
-      - "9092:9092"
-    restart: unless-stopped
-    profiles:
-      - mq
-      - full
-
-  # ---- Redis（伪同步结果回调）----
-  redis:
-    image: redis:7-alpine
-    container_name: mem-redis
-    ports:
-      - "6379:6379"
-    restart: unless-stopped
-    profiles:
-      - mq
-      - full
-
-  # ---- Ollama（可选，需 GPU）----
-  ollama:
-    image: ollama/ollama:latest
-    container_name: mem-ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    restart: unless-stopped
-    profiles:
-      - gpu
-      - full
 
 volumes:
   pgdata:
   qdrant_data:
-  ollama_data:

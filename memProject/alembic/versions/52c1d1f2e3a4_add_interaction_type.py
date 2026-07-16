@@ -1,7 +1,7 @@
 """add_interaction_type
 
 Revision ID: 52c1d1f2e3a4
-Revises: fe65c848d7d5
+Revises: 50bedfeed277
 Create Date: 2026-07-14 10:00:00.000000
 """
 from typing import Sequence, Union
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision: str = '52c1d1f2e3a4'
-down_revision: Union[str, None] = 'fe65c848d7d5'
+down_revision: Union[str, None] = '50bedfeed277'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
