@@ -723,8 +723,9 @@ async def memory_context(
                     existing_content.add(goal_content)
             for item in task_view.get("progress_timeline", []):
                 if item["content"] not in existing_content:
+                    st = item.get("sub_type", "progress")
                     result["fragments"].append({
-                        "memory_type": "task_progress",
+                        "memory_type": f"task_{st}",
                         "content": item["content"],
                         "memory_ids": [item["memory_id"]],
                     })

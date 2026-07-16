@@ -236,13 +236,26 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
 
-# 任务目标关键词 — 命中则视为"目标/诉求"类记忆，走新旧更替逻辑
-_TASK_GOAL_KEYWORDS = {"目标", "目的", "诉求", "任务", "需求", "要做", "实现", "完成目标", "交付", "goal", "objective", "task"}
+# 任务关键词 — 四分类
+_TASK_GOAL_KEYWORDS = {"目标", "目的", "诉求", "要做", "goal", "objective"}
+_TASK_PENDING_KEYWORDS = {"待办", "需要", "下一步", "计划", "尚未", "还需", "将", "准备"}
+_TASK_CONCLUSION_KEYWORDS = {"完成", "通过", "上线", "稳定", "结束", "验收", "交付", "已实现", "成功"}
+
+
+def _classify_task(content: str, key_points: list) -> str:
+    """返回 goal / pending / conclusion / progress"""
+    text = content + " " + " ".join(key_points or [])
+    if any(kw in text for kw in _TASK_GOAL_KEYWORDS):
+        return "goal"
+    if any(kw in text for kw in _TASK_CONCLUSION_KEYWORDS):
+        return "conclusion"
+    if any(kw in text for kw in _TASK_PENDING_KEYWORDS):
+        return "pending"
+    return "progress"
 
 
 def _is_task_goal(content: str, key_points: list) -> bool:
-    text = content + " " + " ".join(key_points or [])
-    return any(kw in text for kw in _TASK_GOAL_KEYWORDS)
+    return _classify_task(content, key_points) == "goal"
 
 
 async def _create_task_memory(db: AsyncSession, data: dict) -> Memory:
@@ -509,12 +522,15 @@ async def get_task_view(db: AsyncSession, task_id: str) -> dict:
         "progress_timeline": [],
     }
     for m in all_memories:
-        if m.status == "active" and _is_task_goal(m.content or "", m.key_points or []):
-            view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
-        view["progress_timeline"].append({
+        sub_type = _classify_task(m.content or "", m.key_points or [])
+        entry = {
             "memory_id": m.memory_id, "content": m.content,
-            "status": m.status, "created_at": m.created_at.isoformat() if m.created_at else None,
-        })
+            "sub_type": sub_type,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        if sub_type == "goal":
+            view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
+        view["progress_timeline"].append(entry)
 
     return view
 
