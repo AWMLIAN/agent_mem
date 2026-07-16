@@ -50,15 +50,22 @@ class MQProducer:
                 key_serializer=lambda k: k.encode("utf-8") if k else None,
                 acks="all",
                 compression_type="gzip",
-                max_request_size=1048576,       # 1MB
-                linger_ms=5,                     # 短暂批量等待
-                request_timeout_ms=10000,
+                max_request_size=1048576,
+                linger_ms=5,
+                request_timeout_ms=5000,
+                metadata_max_age_ms=3000,  # 快速检测 Kafka 是否可达
             )
-            await self._producer.start()
+            await asyncio.wait_for(
+                self._producer.start(),
+                timeout=3.0  # 3 秒超时，防止启动时长时间阻塞
+            )
             self._started = True
             logger.info(f"Kafka Producer 已连接: {self._settings.kafka.bootstrap_servers}")
+        except asyncio.TimeoutError:
+            logger.warning(f"Kafka 连接超时(3s): {self._settings.kafka.bootstrap_servers} — Kafka 可能未运行")
+            self._started = False
         except KafkaError as e:
-            logger.error(f"Kafka Producer 连接失败: {e}")
+            logger.warning(f"Kafka Producer 连接失败: {e} — Kafka 可能未运行")
             self._started = False
         except Exception as e:
             logger.error(f"Kafka Producer 初始化异常: {e}")

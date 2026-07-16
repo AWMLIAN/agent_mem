@@ -37,6 +37,7 @@ from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
+    DEFAULT_DEV_SCENE_ID,
     get_current_agent,
     get_current_user_id,
     get_current_scene_id,
@@ -144,6 +145,8 @@ async def memory_write(
     agent_id: str = Depends(get_current_agent),
     user_id_header: str = Depends(get_current_user_id),
     scene_id: str | None = Depends(get_current_scene_id),
+    session_id_header: str | None = Depends(get_current_session_id),
+    task_id_header: str | None = Depends(get_current_task_id),
 ):
     """
     同步写入记忆数据，支持三种数据类型：
@@ -163,10 +166,11 @@ async def memory_write(
     itype = body.interaction_type
     settings = get_settings()
 
-    # 合并 ID 来源（Header > Body）
+    # 合并 ID 来源（Header > Body，开发模式自动补默认值）
     effective_user_id = normalize_id(user_id_header or body.user_id)
-    effective_scene_id = scene_id or body.scene_id
-    effective_session_id = body.session_id or f"sess_{uuid4().hex[:12]}"
+    effective_scene_id = scene_id or body.scene_id or DEFAULT_DEV_SCENE_ID
+    effective_session_id = session_id_header or body.session_id or f"sess_{uuid4().hex[:12]}"
+    effective_task_id = task_id_header or body.task_id
 
     # 业务级校验（ID 格式 + 类型感知校验）
     if effective_user_id:
@@ -188,7 +192,8 @@ async def memory_write(
 
     # --- 写入原始交互记录（批量 insert）---
     await _batch_write_records(body, db, effective_user_id, agent_id,
-                                effective_scene_id, effective_session_id)
+                                effective_scene_id, effective_session_id,
+                                effective_task_id)
     await db.commit()
 
     # ============================================================
@@ -296,7 +301,7 @@ async def memory_write(
 
 async def _batch_write_records(
     body: MemoryWriteRequest, db, user_id: str, agent_id: str,
-    scene_id: str | None, session_id: str
+    scene_id: str | None, session_id: str, task_id: str | None = None
 ) -> None:
     """批量写入交互记录（使用单条 INSERT ... VALUES 多条）"""
     from datetime import datetime, timezone
@@ -309,7 +314,7 @@ async def _batch_write_records(
         "agent_id": agent_id,
         "scene_id": scene_id,
         "session_id": session_id,
-        "task_id": body.task_id,
+        "task_id": task_id,
         "interaction_type": itype,
         "content_type": "text",
         "processed": False,

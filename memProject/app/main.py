@@ -3,6 +3,11 @@
 FastAPI 应用入口 — 智能体记忆系统（开发阶段）。
 """
 
+# ── 必须在所有导入之前：抑制 websockets 库的弃用警告 ──
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="websockets")
+warnings.filterwarnings("ignore", message=".*websockets.legacy.*")
+
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
