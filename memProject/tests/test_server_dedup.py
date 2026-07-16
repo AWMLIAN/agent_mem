@@ -2,11 +2,11 @@
 """
 服务器端去重融合全量测试 — test_dataset_full.jsonl (126 条对话)
 
-测试目标：
-  1. 对全部 126 条对话调用服务器 POST /api/v1/memory/write
-  2. 追踪每条的去重行为：ADD / MERGE / SKIP / CONFLICT
-  3. 统计各 user_id 的去重命中率
-  4. 生成 JSON 报告
+特性：
+  - 严格串行：一次只发送一个请求，绝不并发
+  - 请求间延迟 0.5s 保护服务器
+  - 失败自动重试（最多 3 次，指数退避）
+  - 使用 requests.Session() 复用 TCP 连接
 
 运行方式：
   python tests/test_server_dedup.py
@@ -15,13 +15,10 @@
 import json
 import sys
 import time
-import urllib.request
-import urllib.error
 from pathlib import Path
 from collections import defaultdict
 
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+import requests
 
 # ============================================================
 # 配置
@@ -31,8 +28,12 @@ SERVER = "http://localhost:8000"
 DATASET = Path(__file__).parent / "test_dataset_full.jsonl"
 REPORT_PATH = Path(__file__).parent / "server_dedup_report.json"
 PROGRESS_PATH = Path(__file__).parent / "server_dedup_progress.txt"
-
 SCENE_ID = "test_dedup"
+
+REQUEST_DELAY = 0.5       # 请求间延迟（秒），保护服务器
+MAX_RETRIES = 3           # 连接失败最大重试次数
+RETRY_BACKOFF = 2.0       # 重试退避基数（秒）
+TIMEOUT = 300             # 单次请求超时（秒），Pipeline 可能很慢
 
 
 def load_dataset(path: Path) -> list[dict]:
@@ -50,46 +51,13 @@ def load_dataset(path: Path) -> list[dict]:
     return recs
 
 
-def call_write(server: str, record: dict) -> dict:
-    """调用 POST /api/v1/memory/write，返回解析后的 JSON 或错误信息。"""
-    url = f"{server}/api/v1/memory/write"
-
-    body = {
-        "user_id": record.get("user_id", "unknown"),
-        "scene_id": SCENE_ID,
-        "session_id": record.get("conversation_id", ""),
-        "interaction_type": "dialogue",
-        "messages": record.get("messages", []),
-    }
-
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        err_body = ""
-        try:
-            err_body = e.read().decode("utf-8")[:500]
-        except Exception:
-            pass
-        return {"_error": f"HTTP {e.code}", "_detail": err_body}
-    except Exception as e:
-        return {"_error": str(e)}
-
-
 def classify_event(item: dict) -> str:
     """根据 results 条目判断实际去重动作。"""
     event = item.get("event", "?")
     memory = item.get("memory", "")
     if memory.startswith("[冲突]"):
         return "CONFLICT"
-    return event  # ADD / SKIP / MERGE
+    return event
 
 
 def main():
@@ -97,11 +65,12 @@ def main():
     print("  服务器去重融合全量测试")
     print(f"  服务器: {SERVER}")
     print(f"  数据集: {DATASET}")
+    print(f"  模式: 严格串行 | 延迟={REQUEST_DELAY}s | 重试={MAX_RETRIES}次")
     print("=" * 60)
 
     records = load_dataset(DATASET)
     total = len(records)
-    print(f"\n已加载 {total} 条对话记录")
+    print(f"\n已加载 {total} 条对话记录\n")
 
     # 统计
     stats = {
@@ -110,40 +79,74 @@ def main():
         "event_counts": defaultdict(int),
         "user_stats": defaultdict(lambda: {"total": 0, "ADD": 0, "SKIP": 0, "MERGE": 0, "CONFLICT": 0}),
         "lats": [],
+        "retries": 0,
         "details": [],
     }
 
-    batch_start = time.time()
-    t0 = batch_start
+    t0 = time.time()
+    batch_start = t0
 
-    # 写入进度头
     with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
         f.write(f"Server Dedup Test: {total} conversations\n")
+
+    # 使用 Session 复用 TCP 连接
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json"})
 
     for idx, rec in enumerate(records):
         uid = rec.get("user_id", "unknown")
         cid = rec.get("conversation_id", f"c{idx}")
         n_msgs = len(rec.get("messages", []))
 
+        body = {
+            "user_id": uid,
+            "scene_id": SCENE_ID,
+            "session_id": cid,
+            "interaction_type": "dialogue",
+            "messages": rec.get("messages", []),
+        }
+
+        # --- 发送请求（带重试） ---
+        result = None
         t1 = time.time()
-        result = call_write(SERVER, rec)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = session.post(
+                    f"{SERVER}/api/v1/memory/write",
+                    json=body,
+                    timeout=TIMEOUT,
+                )
+                result = resp.json()
+                break  # 成功
+            except requests.exceptions.ConnectionError as e:
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_BACKOFF ** attempt
+                    print(f"  [{idx+1}/{total}] 连接失败 (尝试 {attempt}/{MAX_RETRIES}), {wait:.0f}s 后重试...", flush=True)
+                    time.sleep(wait)
+                    stats["retries"] += 1
+                else:
+                    result = {"_error": f"ConnectionError after {MAX_RETRIES} retries: {e}"}
+            except requests.exceptions.Timeout:
+                result = {"_error": "Timeout (>5min)"}
+                break
+            except Exception as e:
+                result = {"_error": str(e)}
+                break
+
         lat = time.time() - t1
         stats["lats"].append(lat)
 
+        # --- 处理结果 ---
         detail = {
-            "index": idx,
-            "user_id": uid,
-            "conversation_id": cid,
-            "messages": n_msgs,
-            "latency_s": round(lat, 2),
+            "index": idx, "user_id": uid, "conversation_id": cid,
+            "messages": n_msgs, "latency_s": round(lat, 1),
         }
 
-        if "_error" in result:
+        if result is None or "_error" in (result or {}):
             stats["err"] += 1
             detail["status"] = "ERROR"
-            detail["error"] = result["_error"]
-            detail["detail"] = result.get("_detail", "")
-            print(f"  [{idx+1}/{total}] ERROR: {uid}/{cid} -> {result['_error']}", flush=True)
+            detail["error"] = (result or {}).get("_error", "unknown")
+            print(f"  [{idx+1}/{total}] ERROR: {uid}/{cid} -> {detail['error']}", flush=True)
         else:
             stats["ok"] += 1
             results = result.get("data", {}).get("results", [])
@@ -162,14 +165,17 @@ def main():
 
         stats["details"].append(detail)
 
-        # 每 20 条输出进度
-        if (idx + 1) % 20 == 0:
-            elapsed = time.time() - batch_start
-            rate = 20 / max(elapsed, 0.01)
-            avg_lat = sum(stats["lats"][-20:]) / max(len(stats["lats"][-20:]), 1)
+        # --- 进度报告 ---
+        if (idx + 1) % 10 == 0 or idx == total - 1:
+            elapsed_total = time.time() - t0
+            elapsed_batch = time.time() - batch_start
+            n_batch = min(10, (idx + 1) % 10 or 10)
+            rate = n_batch / max(elapsed_batch, 0.01)
+            avg_lat = sum(stats["lats"][-10:]) / max(len(stats["lats"][-10:]), 1)
             msg = (
-                f"[{idx+1}/{total}] rate={rate:.2f}/s avg={avg_lat:.1f}s "
-                f"ok={stats['ok']} err={stats['err']} "
+                f"[{idx+1}/{total}] elapsed={elapsed_total:.0f}s batch_rate={rate:.1f}/s "
+                f"avg_lat={avg_lat:.1f}s ok={stats['ok']} err={stats['err']} "
+                f"retries={stats['retries']} | "
                 f"ADD={stats['ADD']} MERGE={stats['MERGE']} "
                 f"SKIP={stats['SKIP']} CONFLICT={stats['CONFLICT']}"
             )
@@ -178,6 +184,11 @@ def main():
                 f.write(msg + "\n")
             batch_start = time.time()
 
+        # --- 请求间延迟（保护服务器） ---
+        if idx < total - 1:
+            time.sleep(REQUEST_DELAY)
+
+    session.close()
     dur = time.time() - t0
 
     # ============================================================
@@ -195,7 +206,7 @@ def main():
 {'='*60}
 
 ── 总体 ──
-处理: {stats['ok']}/{total} 成功, {stats['err']} 异常
+处理: {stats['ok']}/{total} 成功, {stats['err']} 异常, {stats['retries']} 次重试
 耗时: {dur:.0f}s ({dur/60:.1f}min)
 吞吐: {stats['ok']/max(dur,0.01):.2f} 条/秒
 
@@ -205,7 +216,7 @@ P50: {p50:.1f}s  P95: {p95:.1f}s
 
 ── 去重效果 ──
 总动作: {total_events}
-去重命中率: {dedup_hit:.1%} (非 ADD 占比)
+去重命中率: {dedup_hit:.1%}
 ADD (新增):   {stats['ADD']}
 MERGE (合并): {stats['MERGE']}
 SKIP (跳过):  {stats['SKIP']}
@@ -243,6 +254,7 @@ CONFLICT:     {stats['CONFLICT']}
         "total": total,
         "ok": stats["ok"],
         "errors": stats["err"],
+        "retries": stats["retries"],
         "duration_s": round(dur, 1),
         "throughput": round(stats["ok"] / max(dur, 0.01), 2),
         "avg_latency_s": round(sum(stats["lats"]) / max(len(stats["lats"]), 1), 1),
@@ -250,14 +262,11 @@ CONFLICT:     {stats['CONFLICT']}
         "p95_s": round(p95, 1),
         "dedup_hit_rate": round(dedup_hit, 3),
         "events": dict(stats["event_counts"]),
-        "user_stats": {
-            uid: dict(us) for uid, us in stats["user_stats"].items()
-        },
+        "user_stats": {uid: dict(us) for uid, us in stats["user_stats"].items()},
     }
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         json.dump(json_report, f, ensure_ascii=False, indent=2)
 
-    # 尾部
     with open(PROGRESS_PATH, "a", encoding="utf-8") as f:
         f.write(f"\nDone. OK={stats['ok']} ERR={stats['err']} DUR={dur:.0f}s\n")
 
