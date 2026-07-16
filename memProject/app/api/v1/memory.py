@@ -710,23 +710,32 @@ async def memory_context(
 
         # 增强层：叠加上下文聚合（任务级/会话级/用户级）
         if body.task_id:
+            existing_content = {f.get("content", "") for f in result["fragments"]}
             task_view = await get_task_view(db, body.task_id)
             if task_view.get("current_goal"):
-                result["fragments"].append({
-                    "memory_type": "task_goal",
-                    "content": task_view["current_goal"]["content"],
-                    "memory_ids": [task_view["current_goal"]["memory_id"]],
-                })
+                goal_content = task_view["current_goal"]["content"]
+                if goal_content not in existing_content:
+                    result["fragments"].append({
+                        "memory_type": "task_goal",
+                        "content": goal_content,
+                        "memory_ids": [task_view["current_goal"]["memory_id"]],
+                    })
+                    existing_content.add(goal_content)
             for item in task_view.get("progress_timeline", []):
-                result["fragments"].append({
-                    "memory_type": f"task_{item.get('status', 'progress')}",
-                    "content": item["content"],
-                    "memory_ids": [item["memory_id"]],
-                })
+                if item["content"] not in existing_content:
+                    result["fragments"].append({
+                        "memory_type": f"task_{item.get('status', 'progress')}",
+                        "content": item["content"],
+                        "memory_ids": [item["memory_id"]],
+                    })
+                    existing_content.add(item["content"])
 
         elif body.session_id:
+            existing_content = {f.get("content", "") for f in result["fragments"]}
             sess_ctx = await get_session_context(db, body.session_id)
             for item in sess_ctx.get("key_items", []):
+                if item["content"] in existing_content:
+                    continue
                 result["fragments"].append({
                     "memory_type": f"key_{item.get('memory_type', '')}",
                     "content": item["content"],
