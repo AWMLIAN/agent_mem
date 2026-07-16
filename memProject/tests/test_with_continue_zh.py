@@ -41,7 +41,7 @@ from app.core.qdrant_client import qdrant_client
 # 配置
 # ============================================================
 
-DATASET_PATH = "E:/AI Memory/continue_zh.jsonl"
+DATASET_PATH = str(Path(__file__).resolve().parent.parent.parent.parent / "continue_zh.jsonl")
 SAMPLE_SIZE = 10          # 测试采样数量
 MAX_CONV_TURNS = 6        # 每条对话最多取前 N 轮
 MAX_TEXT_LENGTH = 3000    # 单次输入最大字符数

@@ -12,7 +12,13 @@ import yaml
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 
-load_dotenv(Path(__file__).parent.parent.parent / ".env")
+# 按优先级查找 .env：项目根目录 → 当前工作目录
+_env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+if not _env_path.exists():
+    _env_path = Path.cwd() / ".env"
+if not _env_path.exists():
+    _env_path = Path.cwd().parent / ".env"
+load_dotenv(_env_path)
 
 
 class AppConfig(BaseSettings):

@@ -331,7 +331,7 @@ def get_default_memory_config():
     # --- HARDCODED CONFIG: DeepSeek + SiliconFlow + Qdrant ---
     llm_config = {
         "model": "deepseek-chat",
-        "api_key": "sk-e26e80a8301a4ac6b258aaeb37109653",
+        "api_key": "sk-77d04b1346a84e36ab8bc7bc4e3cf6a7",
         "openai_base_url": "https://api.deepseek.com/v1",
         "temperature": 0.1,
         "max_tokens": 2000,
@@ -340,7 +340,7 @@ def get_default_memory_config():
 
     embedder_config = {
         "model": "BAAI/bge-m3",
-        "api_key": "sk-jlfoktbgjblimcxidlqqanwnermgjziqknioboqoftgzimvj",
+        "api_key": "sk-vzufmpweobqkehggmobxafhumlfxphcejystwexrmodgkrde",
         "openai_base_url": "https://api.siliconflow.cn/v1",
     }
     print("Embedder: SiliconFlow bge-m3 (hardcoded)")
