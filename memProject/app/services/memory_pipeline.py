@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import MemoryGenerationError
 from app.core.logger import get_logger
 from app.core.qdrant_client import QdrantClientSingleton, qdrant_client as _qdrant_singleton
-from app.models.base import Memory
+from app.models.base import Memory, MemoryRelation
 from app.services.embedding_client import EmbeddingClient, embedding_client as _embedding_singleton
 from app.services.llm_client import LLMClient, llm_client as _llm_singleton
 from app.services.memory_dedup import (
@@ -28,6 +28,12 @@ from app.services.memory_dedup import (
 )
 from app.services.memory_extractor import ExtractionResult, MemoryExtractor
 from app.services.memory_generator import MemoryCandidate, MemoryGenerator
+from app.services.memory_quality import (
+    QualityReport,
+    judge_extraction_value,
+    verify_candidates_batch,
+    QualityAuditor,
+)
 
 logger = get_logger("memory_pipeline")
 
@@ -38,6 +44,23 @@ def _now() -> datetime:
 
 def _gen_id(prefix: str = "mem") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
+def _create_relation(
+    source_id: str,
+    target_id: str,
+    relation_type: str,
+    description: str = "",
+    confidence: float = 0.8,
+) -> MemoryRelation:
+    """创建记忆关系边。"""
+    return MemoryRelation(
+        source_memory_id=source_id,
+        target_memory_id=target_id,
+        relation_type=relation_type,
+        description=description,
+        confidence=confidence,
+    )
 
 
 # ============================================================
@@ -52,6 +75,7 @@ class PipelineResult:
     merged_count: int = 0
     discarded_count: int = 0
     updated_count: int = 0
+    conflict_count: int = 0
     details: list[dict] = field(default_factory=list)
 
 
@@ -83,17 +107,32 @@ class MemoryPipeline:
             agent_id="agent_001",
             db=db_session,
         )
+
+    去重参数可配置：
+        - dedup_weights: (vector_weight, keyword_weight, identity_weight)
+        - dedup_thresholds: (discard, update_existing_with_identity, merge_min)
     """
+
+    # 可配置的去重默认参数
+    DEDUP_WEIGHTS = (0.5, 0.3, 0.2)       # vector, keyword, identity
+    DEDUP_THRESHOLDS = (0.90, 0.80, 0.65)  # discard, update(需identity), merge
+    LLM_AUDIT_ENABLED = True                # 是否启用 LLM 深度审计
 
     def __init__(
         self,
         llm: Optional[LLMClient] = None,
         embedding: Optional[EmbeddingClient] = None,
         qdrant: Optional[QdrantClientSingleton] = None,
+        dedup_weights: Optional[tuple[float, float, float]] = None,
+        dedup_thresholds: Optional[tuple[float, float, float]] = None,
+        enable_llm_audit: Optional[bool] = None,
     ) -> None:
         self._llm = llm
         self._embedding = embedding
         self._qdrant = qdrant
+        self.dedup_weights = dedup_weights or self.DEDUP_WEIGHTS
+        self.dedup_thresholds = dedup_thresholds or self.DEDUP_THRESHOLDS
+        self.enable_llm_audit = enable_llm_audit if enable_llm_audit is not None else self.LLM_AUDIT_ENABLED
 
         # 惰性初始化的子服务
         self._extractor: Optional[MemoryExtractor] = None
@@ -127,7 +166,11 @@ class MemoryPipeline:
         if self._generator is None:
             self._generator = MemoryGenerator(self.llm)
         if self._dedup is None:
-            self._dedup = DedupService(self.embedding, self.qdrant)
+            vw, kw, iw = self.dedup_weights
+            self._dedup = DedupService(
+                self.embedding, self.qdrant,
+                vector_weight=vw, keyword_weight=kw, identity_weight=iw,
+            )
 
     # ---- 主流程 ----
 
@@ -184,6 +227,18 @@ class MemoryPipeline:
             logger.info("Extraction produced no results, pipeline complete")
             return result
 
+        # ========== Phase 1.5: Value Judgment ==========
+        value_judgment = judge_extraction_value(extraction_result)
+        logger.info(
+            f"Pipeline Phase 1.5/4: Value judgment — "
+            f"overall={value_judgment.overall_value:.2f}, "
+            f"keep={value_judgment.should_keep}, "
+            f"reason={value_judgment.reason}"
+        )
+        if not value_judgment.should_keep:
+            logger.info("Value judgment recommends discard, pipeline complete")
+            return result
+
         # ========== Phase 2: Generate ==========
         logger.info("Pipeline Phase 2/4: Generating structured memories")
         try:
@@ -195,6 +250,45 @@ class MemoryPipeline:
             logger.info("No memory candidates generated, pipeline complete")
             return result
 
+        # ========== Phase 2.5: Quality Verification ==========
+        logger.info(f"Pipeline Phase 2.5/4: Verifying quality of {len(candidates)} candidates")
+        quality_reports: list[QualityReport] = verify_candidates_batch(
+            candidates, source_text=text
+        )
+
+        # LLM 深度审计：对高重要性候选记忆启用（如果 LLM 可用）
+        high_importance_candidates = [
+            (i, c) for i, c in enumerate(candidates) if c.importance >= 0.7
+        ]
+        if high_importance_candidates and self.llm and self.enable_llm_audit:
+            try:
+                auditor = QualityAuditor(self.llm)
+                logger.info(
+                    f"LLM deep audit: {len(high_importance_candidates)}/{len(candidates)} "
+                    f"high-importance candidates"
+                )
+                hi_candidates = [c for _, c in high_importance_candidates]
+                llm_reports = await auditor.audit(hi_candidates, source_text=text)
+                # 用 LLM 审计结果覆盖规则引擎结果
+                for (idx, _), llm_report in zip(high_importance_candidates, llm_reports):
+                    quality_reports[idx] = llm_report
+            except Exception as e:
+                logger.warning(f"LLM deep audit failed, keeping rule-based results: {e}")
+
+        # 为每个 candidate 附加质量报告（用于后续存储）
+        candidate_quality_map: dict[int, QualityReport] = {
+            i: qr for i, qr in enumerate(quality_reports)
+        }
+
+        # 统计质量
+        active_count = sum(1 for qr in quality_reports if qr.suggested_status == "active")
+        pending_count = sum(1 for qr in quality_reports if qr.suggested_status == "pending")
+        logger.info(
+            f"Quality verification complete: "
+            f"active={active_count}, pending={pending_count}, "
+            f"avg_score={sum(qr.quality_score for qr in quality_reports) / max(len(quality_reports), 1):.2f}"
+        )
+
         # ========== Phase 3: Dedup ==========
         logger.info(f"Pipeline Phase 3/4: Deduplicating {len(candidates)} candidates")
         if db is not None and self.qdrant.is_available:
@@ -204,6 +298,7 @@ class MemoryPipeline:
                     user_id=user_id,
                     db=db,
                     task_id=task_id,
+                    session_id=session_id,
                 )
             except Exception as e:
                 logger.warning(f"Dedup failed, treating all as KEEP_NEW: {e}")
@@ -252,6 +347,7 @@ class MemoryPipeline:
                 task_id=task_id,
                 source_record_ids=source_record_ids,
                 db=db,
+                candidate_quality_map=candidate_quality_map,
             )
 
         # 汇总结果
@@ -281,10 +377,15 @@ class MemoryPipeline:
                     result.memory_ids.append(dr.memory_id)
             elif dr.action == DedupAction.DISCARD:
                 result.discarded_count += 1
+            elif dr.action == DedupAction.CONFLICT:
+                result.conflict_count += 1
+                if dr.memory_id:
+                    result.memory_ids.append(dr.memory_id)
 
         logger.info(
             f"Pipeline complete: new={result.new_count}, merged={result.merged_count}, "
-            f"updated={result.updated_count}, discarded={result.discarded_count}"
+            f"updated={result.updated_count}, discarded={result.discarded_count}, "
+            f"conflict={result.conflict_count}"
         )
         return result
 
@@ -340,29 +441,28 @@ class MemoryPipeline:
         session_id: Optional[str] = None,
         task_id: Optional[str] = None,
         source_record_ids: Optional[list[str]] = None,
+        candidate_quality_map: Optional[dict[int, "QualityReport"]] = None,
     ) -> None:
-        """将去重结果持久化到 PostgreSQL 和 Qdrant。
-
-        通过 memory_service.create_memory() 走类型感知写入：
-        - preference → 新旧替换
-        - fact → 内容去重 + 冲突检测
-        - task → 目标 vs 进展区分
-        """
-        from app.services.memory_service import create_memory, update_memory_fields, get_memory_by_id
-
+        """将去重结果持久化到 PostgreSQL 和 Qdrant。"""
         vectors_to_upsert: list[list[float]] = []
         vector_payloads: list[dict] = []
         vector_ids: list[str] = []
 
-        for dr in dedup_results:
+        for i, dr in enumerate(dedup_results):
             if dr.action == DedupAction.DISCARD:
                 continue
 
+            # 获取该条记忆的质量报告
+            qr = (candidate_quality_map or {}).get(i)
+            status = qr.suggested_status if qr else "active"
+            quality_score = qr.quality_score if qr else 0.5
+
             if dr.action == DedupAction.KEEP_NEW:
+                # 新建记忆（走 create_memory 类型感知写入）
+                from app.services.memory_service import create_memory
                 memory_id = dr.memory_id or _gen_id("mem")
                 dr.memory_id = memory_id
 
-                # 走类型感知写入（偏好替换、事实去重、任务区分）
                 memory = await create_memory(db, {
                     "memory_id": memory_id,
                     "user_id": user_id,
@@ -376,7 +476,7 @@ class MemoryPipeline:
                     "memory_type": dr.memory_type,
                     "tags": dr.tags,
                     "entities": dr.entities,
-                    "status": "active",
+                    "status": status,
                     "importance": dr.importance,
                     "confidence": dr.confidence,
                     "source_type": "extracted",
@@ -385,6 +485,7 @@ class MemoryPipeline:
                 })
                 await db.flush()
 
+                # 准备向量
                 try:
                     vec = await self.embedding.embed_single(dr.content)
                     vectors_to_upsert.append(vec)
@@ -398,23 +499,50 @@ class MemoryPipeline:
                     logger.warning(f"Failed to embed memory {memory_id}: {e}")
 
             elif dr.action in (DedupAction.MERGE, DedupAction.UPDATE_EXISTING):
+                # 更新已有记忆
                 memory_id = dr.memory_id
                 if not memory_id:
                     continue
 
                 try:
-                    existing = await get_memory_by_id(db, memory_id)
-                    if existing:
-                        # 走 service 层的更新逻辑
-                        await update_memory_fields(db, memory_id, {
-                            "content": dr.content,
-                            "summary": dr.summary,
-                            "importance": dr.importance,
-                            "confidence": dr.confidence,
-                            "tags": dr.tags,
-                        })
-                        await db.flush()
+                    from sqlalchemy import select as _select
+                    result = await db.execute(
+                        _select(Memory).where(Memory.memory_id == memory_id)
+                    )
+                    existing = result.scalar_one_or_none()
 
+                    if existing:
+                        # 保存旧版本信息用于替代关系
+                        old_version = existing.version or 1
+                        old_content = existing.content
+
+                        existing.content = dr.content
+                        existing.summary = dr.summary
+                        existing.key_points = dr.key_points
+                        existing.tags = dr.tags
+                        existing.entities = dr.entities
+                        existing.importance = dr.importance
+                        existing.confidence = dr.confidence
+                        existing.version = old_version + 1
+                        existing.updated_at = _now()
+
+                        # 建立关系图谱边
+                        if dr.action == DedupAction.UPDATE_EXISTING:
+                            relation_type = "replaces"
+                            relation_desc = f"v{old_version} replaced by new content: {dr.summary[:100]}"
+                        else:
+                            relation_type = "supplements"
+                            relation_desc = f"v{old_version} supplemented with: {dr.summary[:100]}"
+
+                        db.add(_create_relation(
+                            source_id=memory_id,
+                            target_id=memory_id,
+                            relation_type=relation_type,
+                            description=relation_desc,
+                            confidence=0.85,
+                        ))
+
+                        # 准备更新向量
                         try:
                             vec = await self.embedding.embed_single(dr.content)
                             vectors_to_upsert.append(vec)
@@ -431,6 +559,73 @@ class MemoryPipeline:
                 except Exception as e:
                     logger.error(f"Failed to update memory {memory_id}: {e}")
 
+            elif dr.action == DedupAction.CONFLICT:
+                # 冲突处理：走 create_memory 类型路由（fact 自动标 conflict）
+                from app.services.memory_service import create_memory
+                memory_id = _gen_id("mem")
+                dr.memory_id = memory_id
+
+                memory = await create_memory(db, {
+                    "memory_id": memory_id,
+                    "user_id": user_id,
+                    "agent_id": agent_id,
+                    "scene_id": scene_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "content": dr.content,
+                    "summary": dr.summary,
+                    "key_points": dr.key_points,
+                    "memory_type": dr.memory_type,
+                    "tags": dr.tags,
+                    "entities": dr.entities,
+                    "status": "conflict",
+                    "importance": dr.importance,
+                    "confidence": dr.confidence,
+                    "source_type": "extracted",
+                    "source_record_ids": source_record_ids or [],
+                    "version": 1,
+                })
+                await db.flush()
+
+                # 为冲突双方建立关系记录
+                for conflict_id in dr.conflict_with:
+                    relation = MemoryRelation(
+                        source_memory_id=memory_id,
+                        target_memory_id=conflict_id,
+                        relation_type="conflicts_with",
+                        description=f"潜在冲突: {dr.message}",
+                        confidence=0.5,
+                    )
+                    db.add(relation)
+
+                    # 将被冲突的旧记忆也标记为 pending（如果当前是 active）
+                    try:
+                        from sqlalchemy import select as _select, update as _update
+                        await db.execute(
+                            _update(Memory)
+                            .where(
+                                Memory.memory_id == conflict_id,
+                                Memory.status == "active",
+                            )
+                            .values(status="pending", updated_at=_now())
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to update conflict target {conflict_id}: {e}")
+
+                # 准备向量
+                try:
+                    vec = await self.embedding.embed_single(dr.content)
+                    vectors_to_upsert.append(vec)
+                    vector_payloads.append({
+                        "user_id": user_id,
+                        "memory_id": memory_id,
+                        "memory_type": dr.memory_type,
+                    })
+                    vector_ids.append(memory_id)
+                except Exception as e:
+                    logger.warning(f"Failed to embed conflict memory {memory_id}: {e}")
+
+        # 提交数据库
         try:
             await db.commit()
             logger.info(f"DB committed: {len(dedup_results)} dedup results")

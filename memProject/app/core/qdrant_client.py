@@ -80,12 +80,16 @@ class QdrantClientSingleton:
     @property
     def client(self) -> QdrantClient:
         if self._client is None:
-            raise VectorStoreError("Qdrant 客户端未初始化，请先调用 initialize()")
+            if not self.initialize():
+                raise VectorStoreError("Qdrant 客户端初始化失败")
         return self._client
 
     @property
     def is_available(self) -> bool:
-        return self._client is not None
+        if self._client is not None:
+            return True
+        # 惰性初始化
+        return self.initialize()
 
     @property
     def collection_name(self) -> str:

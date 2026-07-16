@@ -350,10 +350,11 @@ def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
     将 PipelineResult.details 转换为前端 WriteResultItem 格式。
 
     映射规则:
-      keep_new        → ADD     (新记忆创建)
-      merge           → MERGE   (合并到已有)
-      update_existing → ADD     (更新视为新增信息)
-      discard         → SKIP    (重复或不包含新信息)
+      keep_new        → ADD      (新记忆创建)
+      merge           → MERGE    (合并到已有)
+      update_existing → ADD      (更新视为新增信息)
+      discard         → SKIP     (重复或不包含新信息)
+      conflict        → CONFLICT (冲突需人工确认)
     """
     results = []
     for d in pipeline_result.details:
@@ -372,6 +373,13 @@ def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
                 id=memory_id,
                 memory=content,
                 event=MemoryEvent.MERGE,
+            ))
+        elif action == "conflict":
+            # 冲突：返回给前端标记为冲突，等待人工处理
+            results.append(WriteResultItem(
+                id=memory_id,
+                memory=f"[冲突] {content}",
+                event=MemoryEvent.ADD,  # 仍写入但标记为 pending
             ))
         else:  # keep_new / update_existing
             results.append(WriteResultItem(

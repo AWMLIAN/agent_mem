@@ -298,3 +298,47 @@ class ApiLog(Base):
         Index("idx_api_log_time", "created_at"),
         Index("idx_api_log_agent_path", "agent_id", "api_path"),
     )
+
+
+# ============================================================
+# 13. T_DEDUP_AUDIT
+# ============================================================
+class DedupAudit(Base):
+    """去重融合操作审计记录"""
+    __tablename__ = "t_dedup_audit"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    audit_id = Column(String(64), unique=True, nullable=False, index=True)
+    # 新记忆信息
+    candidate_content = Column(Text)
+    candidate_memory_type = Column(String(64))
+    # 匹配到的历史记忆
+    matched_memory_id = Column(String(64), nullable=True, index=True)
+    matched_content = Column(Text, nullable=True)
+    # 匹配分数
+    vector_score = Column(Float, nullable=True)
+    keyword_overlap = Column(Float, nullable=True)
+    identity_match = Column(Boolean, default=False)
+    composite_score = Column(Float, nullable=True)
+    # 决策结果
+    action = Column(String(32), nullable=False)  # keep_new / merge / discard / update_existing / conflict
+    # 融合前后内容
+    before_content = Column(Text, nullable=True)   # 旧记忆内容
+    after_content = Column(Text, nullable=True)    # 融合后内容
+    # 状态变化
+    old_status = Column(String(32), nullable=True)
+    new_status = Column(String(32), nullable=True)
+    old_version = Column(Integer, nullable=True)
+    new_version = Column(Integer, nullable=True)
+    # 上下文
+    user_id = Column(String(128), nullable=True)
+    task_id = Column(String(128), nullable=True)
+    session_id = Column(String(128), nullable=True)
+    message = Column(Text)
+    created_at = Column(DateTime(timezone=True), default=_now, index=True)
+
+    __table_args__ = (
+        Index("idx_dedup_audit_matched", "matched_memory_id", "created_at"),
+        Index("idx_dedup_audit_action", "action", "created_at"),
+        Index("idx_dedup_audit_user", "user_id", "created_at"),
+    )

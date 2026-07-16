@@ -3,7 +3,7 @@
 记忆生成 Prompt — 将抽取结果转化为结构化记忆对象。
 """
 
-MEMORY_GENERATION_SYSTEM_PROMPT = """You are a memory structuring system. Given extracted facts, task states, and decisions from a conversation, generate structured memory entries. Each memory should be a self-contained, useful piece of information for future retrieval.
+MEMORY_GENERATION_SYSTEM_PROMPT = """You are a memory structuring system. Given extracted facts, task states, decisions, preferences, process information, and feedback from a conversation, generate structured memory entries. Each memory should be a self-contained, useful piece of information for future retrieval.
 
 For each distinct piece of information, produce:
 - content: A natural, standalone memory sentence in the appropriate language (Chinese for Chinese content, English for English content). This is the primary retrievable text.
@@ -11,11 +11,12 @@ For each distinct piece of information, produce:
 - key_points: 2-5 bullet points capturing the essence (as a list of strings).
 - memory_type: One of:
   - "fact": Objective facts, business objects, entities
-  - "preference": User preferences, habits, likes/dislikes
+  - "preference": User preferences, habits, likes/dislikes, decision tendencies
   - "task_state": Task progress, status, pending items
   - "decision": Confirmed plans, choices, rationales
   - "constraint": Rules, limitations, requirements, deadlines
-  - "process": Workflows, procedures, methodologies
+  - "process": Workflows, procedures, methodologies, execution actions, lessons learned
+  - "correction": User corrections, negations, revisions, or replacement of previous statements
 - tags: 2-5 relevant tags for categorization and filtering.
 - entities: Named entities (people, systems, projects, tools) referenced in this memory.
 - importance: 0.0-1.0 float — how critical this information is for future decisions and context.
@@ -23,9 +24,13 @@ For each distinct piece of information, produce:
 
 Guidelines:
 - Group closely related facts into a single memory. Separate unrelated facts into different memories.
+- For user preferences, generate ONE memory per distinct preference area (style, habit, decision tendency).
+- For process information, focus on reusable lessons and failure recovery patterns — not every action needs a memory.
+- For feedback/corrections, prioritize replacement relationships and explicit negations over minor confirmations.
 - Do NOT generate memories for trivial, conversational filler (greetings, small talk, etc.).
 - For task state, create at most ONE memory summarizing the overall task status.
 - If the extracted data is empty or contains only noise, return an empty memories array.
+- Mark memories with low certainty (confidence < 0.5) — they should still be generated but with appropriately low confidence scores.
 - Prioritize information that would be useful in future conversations.
 
 Output ONLY valid JSON: {"memories": [...]}
@@ -47,6 +52,21 @@ Pending Items: {pending_items}
 Confirmed Plans: {confirmed_plans}
 Selection Rationale: {selection_rationale}
 Execution Results: {execution_results}
+
+## User Preferences Extracted
+Style Preferences: {style_preferences}
+Habitual Preferences: {habitual_preferences}
+Decision Tendencies: {decision_tendencies}
+
+## Process Information Extracted
+Execution Actions: {execution_actions}
+Intermediate Conclusions: {intermediate_conclusions}
+Failure Records: {failure_records}
+
+## Feedback & Corrections Extracted
+Corrections: {corrections}
+Confirmation Statuses: {confirmation_statuses}
+Replacement Relationships: {replacement_relationships}
 
 Generate a list of structured memory entries from this data."""
 
@@ -70,6 +90,7 @@ MEMORY_GENERATION_OUTPUT_SCHEMA = {
                             "decision",
                             "constraint",
                             "process",
+                            "correction",
                         ],
                     },
                     "tags": {"type": "array", "items": {"type": "string"}},
