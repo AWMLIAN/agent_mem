@@ -444,7 +444,9 @@ async def build_context_query(db: AsyncSession, filters: dict) -> list[Memory]:
         if include_map.get("preferences"):
             type_conditions.append(Memory.memory_type == "preference")
         if include_map.get("facts"):
-            type_conditions.append(Memory.memory_type == "fact")
+            type_conditions.append(Memory.memory_type.in_(
+                ["fact", "decision", "constraint", "process", "correction"]
+            ))
         if include_map.get("task_state"):
             type_conditions.append(Memory.memory_type == "task_state")
         if type_conditions:

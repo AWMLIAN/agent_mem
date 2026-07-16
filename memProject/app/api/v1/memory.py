@@ -736,16 +736,21 @@ async def memory_context(
 
         elif body.include_preferences or body.include_facts:
             profile = await get_user_profile(db, body.user_id)
+            existing_content = {f.get("content", "") for f in result["fragments"]}
             if body.include_preferences and profile.get("preferences"):
                 for pref in profile["preferences"]:
-                    result["fragments"].append({
-                        "memory_type": "preference", "content": pref, "memory_ids": []
-                    })
+                    if pref not in existing_content:
+                        result["fragments"].append({
+                            "memory_type": "preference", "content": pref, "memory_ids": []
+                        })
+                        existing_content.add(pref)
             if body.include_facts and profile.get("facts"):
                 for fact in profile["facts"]:
-                    result["fragments"].append({
-                        "memory_type": "fact", "content": fact, "memory_ids": []
-                    })
+                    if fact not in existing_content:
+                        result["fragments"].append({
+                            "memory_type": "fact", "content": fact, "memory_ids": []
+                        })
+                        existing_content.add(fact)
 
         # Fire-and-forget 检索日志（仅记录基础层检索结果，不含增强层）
         req_id = str(uuid4())
