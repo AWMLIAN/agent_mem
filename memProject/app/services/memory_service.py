@@ -94,23 +94,43 @@ async def _create_preference(db: AsyncSession, data: dict) -> Memory:
                     if not old_vec:
                         continue
                     similarity = _cosine_sim(new_vec, old_vec)
-                    if similarity >= 0.8:
-                        m.status = "pending_update"
-                        m.replaced_by = new_id
-                        m.updated_at = _now()
-                        replaced += 1
+                    if similarity > 0.98:
+                        m.use_count = (m.use_count or 0) + 1
+                        return m
+                    elif similarity > 0.75:
+                        is_same = await _llm_same_topic_judge(new_content, m.content or "")
+                        if is_same:
+                            m.status = "pending_update"
+                            m.replaced_by = new_id
+                            m.updated_at = _now()
+                            replaced += 1
                 if replaced:
-                    logger.info(f"用户 {user_id} Embedding 替换 {replaced}/{len(old)} 条旧偏好")
+                    logger.info(f"用户 {user_id} LLM判定替换 {replaced}/{len(old)} 条旧偏好")
                 else:
-                    logger.info(f"用户 {user_id} Embedding 无匹配，尝试关键词降级")
-                    return await _create_preference_keyword(db, data)
+                    logger.info(f"用户 {user_id} 无同方面旧偏好，新偏好直接追加")
             except Exception as e:
-                logger.warning(f"Embedding 不可用，降级为关键词判断: {e}")
-                return await _create_preference_keyword(db, data)
+                logger.warning(f"Embedding/LLM 不可用: {e}")
         else:
             return await _insert_memory(db, data)
 
     return await _insert_memory(db, data)
+
+
+async def _llm_same_topic_judge(new_content: str, old_content: str) -> bool:
+    """让 LLM 判断两条偏好是否属于同一方面（应替换旧偏好）。"""
+    try:
+        from app.services.llm_client import llm_client as _llm
+        prompt = f"""判断以下两条用户偏好是否属于同一方面（比如都是关于编程工具/代码风格/饮食偏好等），如果是同一方面，新的会替换旧的。
+
+旧偏好: {old_content[:300]}
+新偏好: {new_content[:300]}
+
+只回答 YES 或 NO。YES=同一方面应替换，NO=不同方面各自保留。
+回答:"""
+        resp = _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
+        return "YES" in resp.upper()
+    except Exception:
+        return False
 
 
 async def _create_preference_keyword(db: AsyncSession, data: dict) -> Memory:
@@ -137,7 +157,7 @@ async def _create_preference_keyword(db: AsyncSession, data: dict) -> Memory:
 
 
 async def _create_fact(db: AsyncSession, data: dict) -> Memory:
-    """事实管理：基于 Embedding 语义相似度去重 + 冲突检测。"""
+    """事实管理：Embedding 初筛 → LLM 判断是否冲突。"""
     content = data.get("content", "")
     user_id = data.get("user_id")
 
@@ -151,28 +171,42 @@ async def _create_fact(db: AsyncSession, data: dict) -> Memory:
                 old_texts = [m.content or "" for m in existing]
                 new_vec = await _emb.embed_single(content)
                 old_vecs = await _emb.embed_batch(old_texts)
-                found_match = False
                 for m, old_vec in zip(existing, old_vecs):
                     if not old_vec:
                         continue
                     similarity = _cosine_sim(new_vec, old_vec)
-                    if similarity > 0.95:
-                        logger.info(f"事实去重：与 {m.memory_id} 语义相似度 {similarity:.2f}，跳过")
+                    if similarity > 0.98:
+                        logger.info(f"事实去重：与 {m.memory_id} 相似度 {similarity:.2f}，跳过")
                         m.use_count = (m.use_count or 0) + 1
                         return m
-                    elif similarity >= 0.85:
-                        data["status"] = "conflict"
-                        data["replaced_by"] = m.memory_id
-                        logger.info(f"事实冲突标记：与 {m.memory_id} 语义相似度 {similarity:.2f}")
-                        found_match = True
-                if not found_match:
-                    logger.info(f"Embedding 无匹配，尝试关键词降级")
-                    return await _create_fact_keyword(db, data)
+                    elif similarity > 0.75:
+                        is_conflict = await _llm_conflict_judge(content, m.content or "")
+                        if is_conflict:
+                            data["status"] = "conflict"
+                            data["replaced_by"] = m.memory_id
+                            logger.info(f"LLM判定冲突：与 {m.memory_id}")
+                            break
             except Exception as e:
-                logger.warning(f"Embedding 不可用，降级为关键词判断: {e}")
-                return await _create_fact_keyword(db, data)
+                logger.warning(f"Embedding/LLM 不可用: {e}")
 
     return await _insert_memory(db, data)
+
+
+async def _llm_conflict_judge(new_content: str, old_content: str) -> bool:
+    """让 LLM 判断两条事实是否真正冲突（而非相关但不矛盾）。"""
+    try:
+        from app.services.llm_client import llm_client as _llm
+        prompt = f"""判断以下两条记忆是否真正冲突（即相互矛盾、不能同时成立），而非仅仅是话题相关。
+
+记忆A: {old_content[:300]}
+记忆B: {new_content[:300]}
+
+只回答 YES 或 NO。YES=真正冲突/矛盾，NO=相关但不冲突/只是不同角度。
+回答:"""
+        resp = _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
+        return "YES" in resp.upper()
+    except Exception:
+        return False
 
 
 async def _create_fact_keyword(db: AsyncSession, data: dict) -> Memory:
