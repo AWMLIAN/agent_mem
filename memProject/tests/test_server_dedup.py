@@ -146,7 +146,7 @@ def main():
             print(f"  [{idx+1}/{total}] ERROR: {uid}/{cid} -> {result['_error']}", flush=True)
         else:
             stats["ok"] += 1
-            results = result.get("results", [])
+            results = result.get("data", {}).get("results", [])
             detail["status"] = "OK"
             detail["n_results"] = len(results)
             detail["events"] = []
