@@ -127,7 +127,7 @@ async def _llm_same_topic_judge(new_content: str, old_content: str) -> bool:
 
 只回答 YES 或 NO。YES=同一方面应替换，NO=不同方面各自保留。
 回答:"""
-        resp = _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
+        resp = await _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
         return "YES" in resp.upper()
     except Exception:
         return False
@@ -203,7 +203,7 @@ async def _llm_conflict_judge(new_content: str, old_content: str) -> bool:
 
 只回答 YES 或 NO。YES=真正冲突/矛盾，NO=相关但不冲突/只是不同角度。
 回答:"""
-        resp = _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
+        resp = await _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
         return "YES" in resp.upper()
     except Exception:
         return False
