@@ -726,11 +726,76 @@ class MemoryStore:
             except Exception as e:
                 logger.warning(f"Qdrant delete failed (non-fatal): {e}")
 
+        # 自动清理：每次软删除后顺手清掉超过14天的已删数据
+        purged = await self.purge_deleted(db, older_than_days=14, dry_run=False)
+
         return {
             "memory_id": memory_id,
             "deleted": True,
             "previous_status": previous_status,
+            "auto_purged": purged.get("deleted", 0),
         }
+
+    async def purge_deleted(
+        self,
+        db: AsyncSession,
+        older_than_days: int = 30,
+        dry_run: bool = False,
+    ) -> dict:
+        """
+        物理清理软删除超过 N 天的记忆。
+
+        dry_run=True 时只统计不删除。
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+
+        # 统计待清理
+        count_stmt = (
+            select(func.count())
+            .select_from(Memory)
+            .where(
+                Memory.status == "deleted",
+                Memory.updated_at < cutoff,
+            )
+        )
+        total = (await db.execute(count_stmt)).scalar() or 0
+
+        if dry_run or total == 0:
+            return {"deleted": 0, "total_candidates": total, "dry_run": dry_run}
+
+        # 物理删除
+        delete_stmt = (
+            delete(Memory)
+            .where(
+                Memory.status == "deleted",
+                Memory.updated_at < cutoff,
+            )
+        )
+        result = await db.execute(delete_stmt)
+        await db.commit()
+
+        deleted_count = result.rowcount
+
+        # 同步清理 Qdrant（尽力而为）
+        if self.qdrant.is_available and deleted_count > 0:
+            try:
+                ids_stmt = (
+                    select(Memory.memory_id)
+                    .where(
+                        Memory.status == "deleted",
+                        Memory.updated_at < cutoff,
+                    )
+                )
+                remaining = (await db.execute(ids_stmt)).scalars().all()
+                if not remaining:
+                    self.qdrant.delete_vectors(list(remaining))
+            except Exception as e:
+                logger.warning(f"Qdrant purge failed (non-fatal): {e}")
+
+        logger.info(f"Purged {deleted_count} deleted memories older than {older_than_days} days")
+        return {"deleted": deleted_count, "total_candidates": total, "dry_run": False}
 
 
 # 模块级单例

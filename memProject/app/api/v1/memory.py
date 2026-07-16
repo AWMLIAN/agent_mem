@@ -64,6 +64,11 @@ from app.schemas.memory import (
 )
 from app.services.memory_pipeline import memory_pipeline
 from app.services.memory_store import memory_store
+from app.services.memory_service import (
+    get_user_profile,
+    get_session_context,
+    get_task_view,
+)
 from app.services.mq_producer import mq_producer
 from app.services.validation_service import (
     validate_id_format,
@@ -602,11 +607,13 @@ async def memory_context(
     agent_id: str = Depends(get_current_agent),
 ):
     """
-    检索记忆并格式化为可直接注入 AI Prompt 的文本。
+    Prompt 上下文。
 
-    按类型分组，带 emoji 标记，便于 LLM 理解。
+    基础层：memory_store.get_context() — Qdrant 语义检索 + 类型分组
+    增强层：有 task_id / session_id 时，额外附加三层聚合结果
     """
     try:
+        # 基础层：master 的语义检索上下文
         result = await memory_store.get_context(
             query=body.query,
             user_id=body.user_id,
@@ -625,6 +632,47 @@ async def memory_context(
             include_facts=body.include_facts,
             include_task_state=body.include_task_state,
         )
+
+        # 增强层：叠加上下文聚合（任务级/会话级/用户级）
+        if body.task_id:
+            task_view = await get_task_view(db, body.task_id)
+            if task_view.get("current_goal"):
+                result["fragments"].append({
+                    "memory_type": "task_goal",
+                    "content": task_view["current_goal"]["content"],
+                    "memory_ids": [task_view["current_goal"]["memory_id"]],
+                })
+            for item in task_view.get("progress_timeline", []):
+                result["fragments"].append({
+                    "memory_type": f"task_{item.get('status', 'progress')}",
+                    "content": item["content"],
+                    "memory_ids": [item["memory_id"]],
+                })
+
+        elif body.session_id:
+            sess_ctx = await get_session_context(db, body.session_id)
+            for item in sess_ctx.get("key_items", []):
+                result["fragments"].append({
+                    "memory_type": f"key_{item.get('memory_type', '')}",
+                    "content": item["content"],
+                    "memory_ids": [item["memory_id"]],
+                    "key": True,
+                })
+
+        elif body.include_preferences or body.include_facts:
+            profile = await get_user_profile(db, body.user_id)
+            if body.include_preferences and profile.get("preferences"):
+                for pref in profile["preferences"]:
+                    result["fragments"].append({
+                        "memory_type": "preference", "content": pref, "memory_ids": []
+                    })
+            if body.include_facts and profile.get("facts"):
+                for fact in profile["facts"]:
+                    result["fragments"].append({
+                        "memory_type": "fact", "content": fact, "memory_ids": []
+                    })
+
+        result["memory_count"] = len(result.get("fragments", []))
         return ok(result)
     except Exception as e:
         logger.error(f"Context generation failed: {e}")

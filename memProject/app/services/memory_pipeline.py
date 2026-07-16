@@ -458,33 +458,32 @@ class MemoryPipeline:
             quality_score = qr.quality_score if qr else 0.5
 
             if dr.action == DedupAction.KEEP_NEW:
-                # 新建记忆
+                # 新建记忆（走 create_memory 类型感知写入）
+                from app.services.memory_service import create_memory
                 memory_id = dr.memory_id or _gen_id("mem")
                 dr.memory_id = memory_id
 
-                memory = Memory(
-                    memory_id=memory_id,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    scene_id=scene_id,
-                    session_id=session_id,
-                    task_id=task_id,
-                    content=dr.content,
-                    summary=dr.summary,
-                    key_points=dr.key_points,
-                    memory_type=dr.memory_type,
-                    tags=dr.tags,
-                    entities=dr.entities,
-                    status=status,
-                    importance=dr.importance,
-                    confidence=dr.confidence,
-                    source_type="extracted",
-                    source_record_ids=source_record_ids or [],
-                    version=1,
-                    created_at=_now(),
-                    updated_at=_now(),
-                )
-                db.add(memory)
+                memory = await create_memory(db, {
+                    "memory_id": memory_id,
+                    "user_id": user_id,
+                    "agent_id": agent_id,
+                    "scene_id": scene_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "content": dr.content,
+                    "summary": dr.summary,
+                    "key_points": dr.key_points,
+                    "memory_type": dr.memory_type,
+                    "tags": dr.tags,
+                    "entities": dr.entities,
+                    "status": status,
+                    "importance": dr.importance,
+                    "confidence": dr.confidence,
+                    "source_type": "extracted",
+                    "source_record_ids": source_record_ids or [],
+                    "version": 1,
+                })
+                await db.flush()
 
                 # 准备向量
                 try:
@@ -561,35 +560,32 @@ class MemoryPipeline:
                     logger.error(f"Failed to update memory {memory_id}: {e}")
 
             elif dr.action == DedupAction.CONFLICT:
-                # 冲突处理：新记忆写入并标记为 pending，同时建立冲突关系
+                # 冲突处理：走 create_memory 类型路由（fact 自动标 conflict）
+                from app.services.memory_service import create_memory
                 memory_id = _gen_id("mem")
                 dr.memory_id = memory_id
 
-                conflict_status = "pending"  # 冲突记忆标记为待验证
-
-                memory = Memory(
-                    memory_id=memory_id,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    scene_id=scene_id,
-                    session_id=session_id,
-                    task_id=task_id,
-                    content=dr.content,
-                    summary=dr.summary,
-                    key_points=dr.key_points,
-                    memory_type=dr.memory_type,
-                    tags=dr.tags,
-                    entities=dr.entities,
-                    status=conflict_status,
-                    importance=dr.importance,
-                    confidence=dr.confidence,
-                    source_type="extracted",
-                    source_record_ids=source_record_ids or [],
-                    version=1,
-                    created_at=_now(),
-                    updated_at=_now(),
-                )
-                db.add(memory)
+                memory = await create_memory(db, {
+                    "memory_id": memory_id,
+                    "user_id": user_id,
+                    "agent_id": agent_id,
+                    "scene_id": scene_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "content": dr.content,
+                    "summary": dr.summary,
+                    "key_points": dr.key_points,
+                    "memory_type": dr.memory_type,
+                    "tags": dr.tags,
+                    "entities": dr.entities,
+                    "status": "conflict",
+                    "importance": dr.importance,
+                    "confidence": dr.confidence,
+                    "source_type": "extracted",
+                    "source_record_ids": source_record_ids or [],
+                    "version": 1,
+                })
+                await db.flush()
 
                 # 为冲突双方建立关系记录
                 for conflict_id in dr.conflict_with:
