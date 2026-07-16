@@ -29,6 +29,7 @@
 import asyncio
 import re as re_module
 import time as time_module
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
@@ -36,6 +37,7 @@ from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
+    DEFAULT_DEV_SCENE_ID,
     get_current_agent,
     get_current_user_id,
     get_current_scene_id,
@@ -43,10 +45,10 @@ from app.api.deps import (
     get_current_task_id,
 )
 from app.core.config import get_settings
-from app.core.database import get_db
+from app.core.database import async_session_factory, get_db
+from app.models.base import InteractionRecord, RetrievalRequest, RetrievalResult
 from app.core.exceptions import ValidationError
 from app.core.logger import get_logger
-from app.models.base import InteractionRecord
 from app.schemas.common import error, ok
 from app.schemas.memory import (
     AsyncWriteRequest,
@@ -80,6 +82,52 @@ logger = get_logger("memory_api")
 router = APIRouter()
 
 
+# ============================================================
+# Fire-and-Forget 检索日志（写 t_retrieval_request + t_retrieval_result）
+# ============================================================
+
+async def _log_retrieval(
+    request_id: str,
+    agent_id: Optional[str],
+    user_id: str,
+    scene_id: Optional[str],
+    session_id: Optional[str],
+    task_id: Optional[str],
+    query_text: str,
+    filter_conditions: dict,
+    top_k: int,
+    results: list[dict],
+    elapsed_ms: int,
+):
+    """异步写检索日志，失败不阻塞主流程。"""
+    try:
+        async with async_session_factory() as log_db:
+            log_db.add(RetrievalRequest(
+                request_id=request_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                scene_id=scene_id,
+                session_id=session_id,
+                task_id=task_id,
+                query_text=query_text,
+                filter_conditions=filter_conditions,
+                top_k=top_k,
+            ))
+            await log_db.flush()
+
+            for rank, mem in enumerate(results):
+                log_db.add(RetrievalResult(
+                    request_id=request_id,
+                    memory_id=mem.get("memory_id", ""),
+                    rank=rank,
+                    relevance_score=mem.get("relevance_score"),
+                ))
+
+            await log_db.commit()
+    except Exception as e:
+        logger.warning(f"Retrieval log write failed (non-fatal): {e}")
+
+
 # Mock 提取器（从共享模块导入，供 memory.py 和 mq_consumer.py 共用）
 from app.services.mock_extractor import mock_extract_results as _mock_extract_results
 
@@ -97,6 +145,8 @@ async def memory_write(
     agent_id: str = Depends(get_current_agent),
     user_id_header: str = Depends(get_current_user_id),
     scene_id: str | None = Depends(get_current_scene_id),
+    session_id_header: str | None = Depends(get_current_session_id),
+    task_id_header: str | None = Depends(get_current_task_id),
 ):
     """
     同步写入记忆数据，支持三种数据类型：
@@ -116,10 +166,11 @@ async def memory_write(
     itype = body.interaction_type
     settings = get_settings()
 
-    # 合并 ID 来源（Header > Body）
+    # 合并 ID 来源（Header > Body，开发模式自动补默认值）
     effective_user_id = normalize_id(user_id_header or body.user_id)
-    effective_scene_id = scene_id or body.scene_id
-    effective_session_id = body.session_id or f"sess_{uuid4().hex[:12]}"
+    effective_scene_id = scene_id or body.scene_id or DEFAULT_DEV_SCENE_ID
+    effective_session_id = session_id_header or body.session_id or f"sess_{uuid4().hex[:12]}"
+    effective_task_id = task_id_header or body.task_id
 
     # 业务级校验（ID 格式 + 类型感知校验）
     if effective_user_id:
@@ -141,7 +192,8 @@ async def memory_write(
 
     # --- 写入原始交互记录（批量 insert）---
     await _batch_write_records(body, db, effective_user_id, agent_id,
-                                effective_scene_id, effective_session_id)
+                                effective_scene_id, effective_session_id,
+                                effective_task_id)
     await db.commit()
 
     # ============================================================
@@ -249,7 +301,7 @@ async def memory_write(
 
 async def _batch_write_records(
     body: MemoryWriteRequest, db, user_id: str, agent_id: str,
-    scene_id: str | None, session_id: str
+    scene_id: str | None, session_id: str, task_id: str | None = None
 ) -> None:
     """批量写入交互记录（使用单条 INSERT ... VALUES 多条）"""
     from datetime import datetime, timezone
@@ -262,7 +314,7 @@ async def _batch_write_records(
         "agent_id": agent_id,
         "scene_id": scene_id,
         "session_id": session_id,
-        "task_id": body.task_id,
+        "task_id": task_id,
         "interaction_type": itype,
         "content_type": "text",
         "processed": False,
@@ -564,6 +616,28 @@ async def memory_search(
             f"Search: user={body.user_id}, query='{body.query[:50]}...', "
             f"found={len(result['results'])}, elapsed={result['elapsed_ms']}ms"
         )
+
+        # Fire-and-forget 检索日志
+        req_id = str(uuid4())
+        asyncio.create_task(_log_retrieval(
+            request_id=req_id,
+            agent_id=agent_id,
+            user_id=body.user_id,
+            scene_id=body.scene_id,
+            session_id=body.session_id,
+            task_id=body.task_id,
+            query_text=body.query,
+            filter_conditions={
+                "memory_types": body.memory_types,
+                "status": body.status,
+                "time_start": str(body.time_start) if body.time_start else None,
+                "time_end": str(body.time_end) if body.time_end else None,
+            },
+            top_k=body.top_k,
+            results=result.get("results", []),
+            elapsed_ms=result.get("elapsed_ms", 0),
+        ))
+
         return ok(result)
     except Exception as e:
         logger.warning(f"MemoryStore search failed, falling back to legacy: {e}")
@@ -632,6 +706,7 @@ async def memory_context(
             include_facts=body.include_facts,
             include_task_state=body.include_task_state,
         )
+        import logging as _lg; _lg.warning(f"DEBUG: get_context memory_count={result.get('memory_count')}, fragments={len(result.get('fragments', []))}, top_k={body.top_k}")
 
         # 增强层：叠加上下文聚合（任务级/会话级/用户级）
         if body.task_id:
@@ -672,7 +747,28 @@ async def memory_context(
                         "memory_type": "fact", "content": fact, "memory_ids": []
                     })
 
-        result["memory_count"] = len(result.get("fragments", []))
+        # Fire-and-forget 检索日志（仅记录基础层检索结果，不含增强层）
+        req_id = str(uuid4())
+        asyncio.create_task(_log_retrieval(
+            request_id=req_id,
+            agent_id=agent_id,
+            user_id=body.user_id,
+            scene_id=body.scene_id,
+            session_id=body.session_id,
+            task_id=body.task_id,
+            query_text=body.query,
+            filter_conditions={
+                "memory_types": body.memory_types,
+                "status": body.status,
+                "top_k": body.top_k,
+                "max_content_length": body.max_content_length,
+                "group_by_type": body.group_by_type,
+            },
+            top_k=body.top_k,
+            results=result.get("fragments", []),
+            elapsed_ms=0,
+        ))
+
         return ok(result)
     except Exception as e:
         logger.error(f"Context generation failed: {e}")
