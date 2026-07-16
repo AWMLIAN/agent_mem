@@ -87,9 +87,10 @@ async def _create_preference(db: AsyncSession, data: dict) -> Memory:
         if old:
             try:
                 from app.services.embedding_client import embedding_client as _emb
+                old_texts = [m.content or "" for m in old]
                 new_vec = await _emb.embed_single(new_content)
-                for m in old:
-                    old_vec = await _emb.embed_single(m.content or "")
+                old_vecs = await _emb.embed_batch(old_texts)
+                for m, old_vec in zip(old, old_vecs):
                     if not old_vec:
                         continue
                     similarity = _cosine_sim(new_vec, old_vec)
@@ -99,9 +100,10 @@ async def _create_preference(db: AsyncSession, data: dict) -> Memory:
                         m.updated_at = _now()
                         replaced += 1
                 if replaced:
-                    logger.info(f"用户 {user_id} 同一方面旧偏好 {replaced}/{len(old)} 条替换")
+                    logger.info(f"用户 {user_id} Embedding 替换 {replaced}/{len(old)} 条旧偏好")
                 else:
-                    logger.info(f"用户 {user_id} 无同方面旧偏好，新偏好直接追加")
+                    logger.info(f"用户 {user_id} Embedding 无匹配，尝试关键词降级")
+                    return await _create_preference_keyword(db, data)
             except Exception as e:
                 logger.warning(f"Embedding 不可用，降级为关键词判断: {e}")
                 return await _create_preference_keyword(db, data)
@@ -146,9 +148,11 @@ async def _create_fact(db: AsyncSession, data: dict) -> Memory:
         if existing:
             try:
                 from app.services.embedding_client import embedding_client as _emb
+                old_texts = [m.content or "" for m in existing]
                 new_vec = await _emb.embed_single(content)
-                for m in existing:
-                    old_vec = await _emb.embed_single(m.content or "")
+                old_vecs = await _emb.embed_batch(old_texts)
+                found_match = False
+                for m, old_vec in zip(existing, old_vecs):
                     if not old_vec:
                         continue
                     similarity = _cosine_sim(new_vec, old_vec)
@@ -160,6 +164,10 @@ async def _create_fact(db: AsyncSession, data: dict) -> Memory:
                         data["status"] = "conflict"
                         data["replaced_by"] = m.memory_id
                         logger.info(f"事实冲突标记：与 {m.memory_id} 语义相似度 {similarity:.2f}")
+                        found_match = True
+                if not found_match:
+                    logger.info(f"Embedding 无匹配，尝试关键词降级")
+                    return await _create_fact_keyword(db, data)
             except Exception as e:
                 logger.warning(f"Embedding 不可用，降级为关键词判断: {e}")
                 return await _create_fact_keyword(db, data)
