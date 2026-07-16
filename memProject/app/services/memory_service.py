@@ -499,7 +499,7 @@ async def get_session_context(db: AsyncSession, session_id: str) -> dict:
 async def get_task_view(db: AsyncSession, task_id: str) -> dict:
     """任务视图：当前目标 + 进展时间线。"""
     all_memories = await search_local(db, {
-        "task_id": task_id, "memory_types": ["task_state"],
+        "task_id": task_id, "memory_types": ["task_state"], "status": "active",
     })
     all_memories.sort(key=lambda m: m.created_at or datetime.min)
 
