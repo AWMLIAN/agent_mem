@@ -339,12 +339,19 @@ CONFLICT      {e1.get('CONFLICT', 0):>8}      {e2.get('CONFLICT', 0):>8}
 
 
 def main():
+    global SERVER, DATASET, REQUEST_DELAY
     parser = argparse.ArgumentParser(description="服务器去重融合全量测试")
     parser.add_argument(
         "--passes", type=int, default=1, choices=(1, 2, 3),
         help="重放遍数：1=建库基线；2=双遍模式验证 MERGE/DISCARD 融合路径",
     )
+    parser.add_argument("--server", default=SERVER, help=f"服务地址（默认 {SERVER}）")
+    parser.add_argument("--dataset", default=str(DATASET), help="JSONL 数据集路径")
+    parser.add_argument("--delay", type=float, default=REQUEST_DELAY, help="请求间延迟秒数")
     args = parser.parse_args()
+    SERVER = args.server
+    DATASET = Path(args.dataset)
+    REQUEST_DELAY = args.delay
 
     print("=" * 60)
     print("  服务器去重融合全量测试")
