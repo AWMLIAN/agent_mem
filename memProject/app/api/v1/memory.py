@@ -212,13 +212,13 @@ async def memory_write(
             for r in raw_results
         ]
         elapsed = round((time_module.perf_counter() - start) * 1000, 2)
-        logger.info(
-            f"[Mock] 同步写入完成: type={itype}, user_id={effective_user_id}, "
-            f"messages={len(body.messages)}, "
+        logger.warning(
+            f"[Mock] 同步写入完成(正则提取, 非真实Pipeline): type={itype}, "
+            f"user_id={effective_user_id}, messages={len(body.messages)}, "
             f"results={len([r for r in raw_results if r['event'] == 'ADD'])}, "
             f"elapsed={elapsed}ms"
         )
-        return ok(MemoryWriteResponse(results=results).model_dump())
+        return ok(MemoryWriteResponse(results=results, mode="mock").model_dump())
 
     # 模式 2: MQ 等待（正式期伪同步，方案二）
     if settings.generation.use_mq_wait:
@@ -231,9 +231,22 @@ async def memory_write(
         )
 
         if mq_ok:
-            # 等待 Consumer 处理结果（带超时降级）
+            # 等待 Consumer 处理结果（超时返回 None，由此处降级并标记）
             from app.services.result_waiter import wait_for_result_with_timeout
             raw_results = await wait_for_result_with_timeout(request_id)
+
+            if raw_results is None:
+                # MQ 等待超时：结果不可知，明确标记降级而非伪装成 SKIP
+                elapsed = round((time_module.perf_counter() - start) * 1000, 2)
+                logger.warning(
+                    f"[MQ_Wait] 等待超时降级: request_id={request_id}, elapsed={elapsed}ms"
+                )
+                return ok(MemoryWriteResponse(
+                    results=[
+                        WriteResultItem(id="", memory="", event=MemoryEvent.SKIP)
+                    ],
+                    mode="mq_timeout",
+                ).model_dump())
 
             results = [
                 WriteResultItem(
@@ -248,7 +261,7 @@ async def memory_write(
                 f"[MQ_Wait] 同步写入完成: request_id={request_id}, "
                 f"elapsed={elapsed}ms"
             )
-            return ok(MemoryWriteResponse(results=results).model_dump())
+            return ok(MemoryWriteResponse(results=results, mode="mq").model_dump())
         else:
             logger.warning("MQ 不可用，降级到 Direct Pipeline")
 
@@ -270,6 +283,7 @@ async def memory_write(
         )
     except Exception as e:
         logger.error(f"Pipeline execution failed: {e}")
+        # 明确标记降级：结果为占位 SKIP，不代表真实去重判定
         return ok(MemoryWriteResponse(
             results=[
                 WriteResultItem(
@@ -278,7 +292,8 @@ async def memory_write(
                     event=MemoryEvent.SKIP,
                 )
                 for m in body.messages
-            ]
+            ],
+            mode="degraded",
         ).model_dump())
 
     # --- 将 PipelineResult 映射为前端 results 格式 ---
@@ -292,7 +307,7 @@ async def memory_write(
         f"discarded={pipeline_result.discarded_count}, elapsed={elapsed}ms"
     )
 
-    return ok(MemoryWriteResponse(results=results).model_dump())
+    return ok(MemoryWriteResponse(results=results, mode="pipeline").model_dump())
 
 
 # ============================================================

@@ -81,6 +81,8 @@ def main():
         "lats": [],
         "retries": 0,
         "details": [],
+        "modes": defaultdict(int),       # 服务端处理路径统计（pipeline/mock/mq/degraded...）
+        "degraded_count": 0,             # 非 pipeline/mq 的降级响应数
     }
 
     t0 = time.time()
@@ -149,7 +151,18 @@ def main():
             print(f"  [{idx+1}/{total}] ERROR: {uid}/{cid} -> {detail['error']}", flush=True)
         else:
             stats["ok"] += 1
-            results = result.get("data", {}).get("results", [])
+            data = result.get("data", {})
+            results = data.get("results", [])
+            # mode 校验：非真实 Pipeline 的响应立即告警（旧版服务端无此字段 → "legacy"）
+            mode = data.get("mode", "legacy")
+            stats["modes"][mode] += 1
+            detail["mode"] = mode
+            if mode not in ("pipeline", "mq"):
+                stats["degraded_count"] += 1
+                print(
+                    f"  [{idx+1}/{total}] ⚠ 降级响应: {uid}/{cid} mode={mode} "
+                    f"— 该条事件不代表真实去重结果!", flush=True
+                )
             detail["status"] = "OK"
             detail["n_results"] = len(results)
             detail["events"] = []
@@ -177,7 +190,8 @@ def main():
                 f"avg_lat={avg_lat:.1f}s ok={stats['ok']} err={stats['err']} "
                 f"retries={stats['retries']} | "
                 f"ADD={stats['ADD']} MERGE={stats['MERGE']} "
-                f"SKIP={stats['SKIP']} CONFLICT={stats['CONFLICT']}"
+                f"SKIP={stats['SKIP']} CONFLICT={stats['CONFLICT']} "
+                f"| modes={dict(stats['modes'])}"
             )
             print(f"  {msg}", flush=True)
             with open(PROGRESS_PATH, "a", encoding="utf-8") as f:
@@ -200,10 +214,24 @@ def main():
     total_events = sum(stats["event_counts"].values())
     dedup_hit = (stats["MERGE"] + stats["SKIP"] + stats["CONFLICT"]) / max(total_events, 1)
 
+    # 有效性判定：只要有降级响应，本报告的去重统计不可信
+    if stats["degraded_count"] > 0:
+        validity = (
+            f"⚠⚠ 报告无效: {stats['degraded_count']}/{stats['ok']} 条响应为降级模式 "
+            f"{dict(stats['modes'])}，事件统计不代表真实去重能力!"
+        )
+    elif stats["modes"].get("legacy", 0) > 0:
+        validity = "⚠ 服务端未返回 mode 字段（旧版），无法验证处理路径，结果存疑"
+    else:
+        validity = f"✔ 全部响应来自真实处理路径 {dict(stats['modes'])}"
+
     report_text = f"""
 {'='*60}
   服务器去重融合测试报告 ({total} 条对话)
 {'='*60}
+
+── 有效性 ──
+{validity}
 
 ── 总体 ──
 处理: {stats['ok']}/{total} 成功, {stats['err']} 异常, {stats['retries']} 次重试
@@ -261,6 +289,8 @@ CONFLICT:     {stats['CONFLICT']}
         "p50_s": round(p50, 1),
         "p95_s": round(p95, 1),
         "dedup_hit_rate": round(dedup_hit, 3),
+        "modes": dict(stats["modes"]),
+        "degraded_count": stats["degraded_count"],
         "events": dict(stats["event_counts"]),
         "user_stats": {uid: dict(us) for uid, us in stats["user_stats"].items()},
     }

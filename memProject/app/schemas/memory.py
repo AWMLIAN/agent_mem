@@ -152,6 +152,12 @@ class WriteResultItem(BaseModel):
 class MemoryWriteResponse(BaseModel):
     """写入响应"""
     results: list[WriteResultItem] = Field(default_factory=list, description="每条消息的处理结果")
+    mode: str = Field(
+        "pipeline",
+        description="实际处理路径: pipeline(真实LLM流水线) / mock(正则提取) / "
+                    "mq(MQ伪同步) / mq_timeout(MQ等待超时降级) / degraded(Pipeline异常降级)。"
+                    "非 pipeline/mq 均为降级结果，测试与监控应告警",
+    )
 
 
 # ============================================================

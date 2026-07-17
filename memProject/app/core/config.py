@@ -93,7 +93,9 @@ class GenerationConfig(BaseSettings):
     schedule_interval_minutes: int = 5
     max_memory_text_length: int = 2000
     max_summary_length: int = 500
-    use_mock_extraction: bool = True
+    # fail-safe: 默认走真实 Pipeline。Mock 仅限开发期在 settings.yaml 显式开启，
+    # 避免配置读取异常时静默返回正则假结果（2026-07-17 全量测试事故根因之一）
+    use_mock_extraction: bool = False
     use_mq_wait: bool = False
 
 
