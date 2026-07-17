@@ -75,23 +75,89 @@ async def create_memory(db: AsyncSession, data: dict) -> Memory:
 
 
 async def _create_preference(db: AsyncSession, data: dict) -> Memory:
-    """偏好管理：新偏好替换旧偏好，旧标记 pending_update。"""
+    """偏好管理：基于 Embedding 语义相似度判断是否同一方面，替换旧偏好。"""
     user_id = data.get("user_id")
+    new_id = data.get("memory_id", "")
+    new_content = data.get("content", "")
+    replaced = 0
+    if user_id:
+        old = await search_local(db, {
+            "user_id": user_id, "memory_types": ["preference"], "status": "active",
+        })
+        if old:
+            try:
+                from app.services.embedding_client import embedding_client as _emb
+                old_texts = [m.content or "" for m in old]
+                new_vec = await _emb.embed_single(new_content)
+                old_vecs = await _emb.embed_batch(old_texts)
+                for m, old_vec in zip(old, old_vecs):
+                    if not old_vec:
+                        continue
+                    similarity = _cosine_sim(new_vec, old_vec)
+                    if similarity > 0.98:
+                        m.use_count = (m.use_count or 0) + 1
+                        return m
+                    elif similarity > 0.75:
+                        is_same = await _llm_same_topic_judge(new_content, m.content or "")
+                        if is_same:
+                            m.status = "pending_update"
+                            m.replaced_by = new_id
+                            m.updated_at = _now()
+                            replaced += 1
+                if replaced:
+                    logger.info(f"用户 {user_id} LLM判定替换 {replaced}/{len(old)} 条旧偏好")
+                else:
+                    logger.info(f"用户 {user_id} 无同方面旧偏好，新偏好直接追加")
+            except Exception as e:
+                logger.warning(f"Embedding/LLM 不可用: {e}")
+        else:
+            return await _insert_memory(db, data)
+
+    return await _insert_memory(db, data)
+
+
+async def _llm_same_topic_judge(new_content: str, old_content: str) -> bool:
+    """让 LLM 判断两条偏好是否属于同一方面（应替换旧偏好）。"""
+    try:
+        from app.services.llm_client import llm_client as _llm
+        prompt = f"""判断以下两条用户偏好是否属于同一方面（比如都是关于编程工具/代码风格/饮食偏好等），如果是同一方面，新的会替换旧的。
+
+旧偏好: {old_content[:300]}
+新偏好: {new_content[:300]}
+
+只回答 YES 或 NO。YES=同一方面应替换，NO=不同方面各自保留。
+回答:"""
+        resp = await _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
+        return "YES" in resp.upper()
+    except Exception:
+        return False
+
+
+async def _create_preference_keyword(db: AsyncSession, data: dict) -> Memory:
+    """关键词去重（Embedding 不可用时的降级方案）。"""
+    import re as _re
+    user_id = data.get("user_id")
+    new_id = data.get("memory_id", "")
+    new_content = data.get("content", "")
+    new_words = set(_re.findall(r'[一-鿿]+|[a-zA-Z]+', new_content.lower()))
+    replaced = 0
     if user_id:
         old = await search_local(db, {
             "user_id": user_id, "memory_types": ["preference"], "status": "active",
         })
         for m in old:
-            m.status = "pending_update"
-            m.updated_at = _now()
-        if old:
-            logger.info(f"用户 {user_id} 旧偏好 {len(old)} 条标记为 pending_update")
-
+            old_words = set(_re.findall(r'[一-鿿]+|[a-zA-Z]+', (m.content or "").lower()))
+            shared = new_words & old_words
+            if len(shared) >= 2:
+                m.status = "pending_update"
+                m.replaced_by = new_id
+                m.updated_at = _now()
+                replaced += 1
     return await _insert_memory(db, data)
 
 
 async def _create_fact(db: AsyncSession, data: dict) -> Memory:
-    """事实管理：简单内容去重 + 冲突检测。"""
+    """事实管理：Embedding 初筛 → LLM 判断是否冲突。"""
     content = data.get("content", "")
     user_id = data.get("user_id")
 
@@ -99,48 +165,150 @@ async def _create_fact(db: AsyncSession, data: dict) -> Memory:
         existing = await search_local(db, {
             "user_id": user_id, "memory_types": ["fact"], "status": "active",
         })
+        if existing:
+            try:
+                from app.services.embedding_client import embedding_client as _emb
+                old_texts = [m.content or "" for m in existing]
+                new_vec = await _emb.embed_single(content)
+                old_vecs = await _emb.embed_batch(old_texts)
+                for m, old_vec in zip(existing, old_vecs):
+                    if not old_vec:
+                        continue
+                    similarity = _cosine_sim(new_vec, old_vec)
+                    if similarity > 0.98:
+                        logger.info(f"事实去重：与 {m.memory_id} 相似度 {similarity:.2f}，跳过")
+                        m.use_count = (m.use_count or 0) + 1
+                        return m
+                    elif similarity > 0.75:
+                        is_conflict = await _llm_conflict_judge(content, m.content or "")
+                        if is_conflict:
+                            data["status"] = "conflict"
+                            data["replaced_by"] = m.memory_id
+                            logger.info(f"LLM判定冲突：与 {m.memory_id}")
+                            break
+            except Exception as e:
+                logger.warning(f"Embedding/LLM 不可用: {e}")
+
+    return await _insert_memory(db, data)
+
+
+async def _llm_conflict_judge(new_content: str, old_content: str) -> bool:
+    """让 LLM 判断两条事实是否真正冲突（而非相关但不矛盾）。"""
+    try:
+        from app.services.llm_client import llm_client as _llm
+        prompt = f"""判断以下两条记忆是否真正冲突（即相互矛盾、不能同时成立），而非仅仅是话题相关。
+
+记忆A: {old_content[:300]}
+记忆B: {new_content[:300]}
+
+只回答 YES 或 NO。YES=真正冲突/矛盾，NO=相关但不冲突/只是不同角度。
+回答:"""
+        resp = await _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
+        return "YES" in resp.upper()
+    except Exception:
+        return False
+
+
+async def _create_fact_keyword(db: AsyncSession, data: dict) -> Memory:
+    """关键词去重（Embedding 不可用时的降级方案）。"""
+    content = data.get("content", "")
+    user_id = data.get("user_id")
+    if user_id and len(content) > 5:
+        existing = await search_local(db, {
+            "user_id": user_id, "memory_types": ["fact"], "status": "active",
+        })
         for m in existing:
             overlap = _content_overlap(content, m.content or "")
             if overlap > 0.9:
-                logger.info(f"事实去重：与 {m.memory_id} 相似度 {overlap:.2f}，跳过")
                 m.use_count = (m.use_count or 0) + 1
                 return m
             elif overlap >= 0.5:
                 data["status"] = "conflict"
-                logger.info(f"事实冲突标记：与 {m.memory_id} 相似度 {overlap:.2f}")
-
+                data["replaced_by"] = m.memory_id
     return await _insert_memory(db, data)
 
 
-# 任务目标关键词 — 命中则视为"目标/诉求"类记忆，走新旧更替逻辑
-_TASK_GOAL_KEYWORDS = {"目标", "目的", "诉求", "任务", "需求", "要做", "实现", "完成目标", "交付", "goal", "objective", "task"}
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """两个向量的余弦相似度。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+
+
+# 任务关键词 — 四分类
+_TASK_GOAL_KEYWORDS = {"目标", "目的", "诉求", "要做", "goal", "objective"}
+_TASK_PENDING_KEYWORDS = {"待办", "需要", "下一步", "计划", "尚未", "还需", "将", "准备"}
+_TASK_CONCLUSION_KEYWORDS = {"完成", "通过", "上线", "稳定", "结束", "验收", "交付", "已实现", "成功"}
+
+
+def _classify_task(content: str, key_points: list) -> str:
+    """返回 goal / pending / conclusion / progress"""
+    text = content + " " + " ".join(key_points or [])
+    if any(kw in text for kw in _TASK_GOAL_KEYWORDS):
+        return "goal"
+    if any(kw in text for kw in _TASK_CONCLUSION_KEYWORDS):
+        return "conclusion"
+    if any(kw in text for kw in _TASK_PENDING_KEYWORDS):
+        return "pending"
+    return "progress"
 
 
 def _is_task_goal(content: str, key_points: list) -> bool:
-    text = content + " " + " ".join(key_points or [])
-    return any(kw in text for kw in _TASK_GOAL_KEYWORDS)
+    return _classify_task(content, key_points) == "goal"
 
 
 async def _create_task_memory(db: AsyncSession, data: dict) -> Memory:
-    """任务记忆管理 — 区分目标与进展。"""
+    """任务记忆管理 — Embedding+LLM判断新目标替换旧目标。"""
     task_id = data.get("task_id")
     content = data.get("content", "")
-    key_points = data.get("key_points", [])
+    if not task_id or not content:
+        return await _insert_memory(db, data)
 
-    if task_id and _is_task_goal(content, key_points):
-        # 目标类：新目标替换旧目标，旧标记 pending_update
-        existing = await search_local(db, {
-            "task_id": task_id, "memory_types": ["task_state"], "status": "active",
-        })
-        old_goals = [m for m in existing if _is_task_goal(m.content or "", m.key_points or [])]
-        for m in old_goals:
-            m.status = "pending_update"
-            m.updated_at = _now()
-        if old_goals:
-            logger.info(f"任务 {task_id} 旧目标 {len(old_goals)} 条标记为 pending_update")
-    # 进展类：直接追加，保留历史链
+    existing = await search_local(db, {
+        "task_id": task_id, "memory_types": ["task_state"], "status": "active",
+    })
+    if not existing:
+        return await _insert_memory(db, data)
+
+    try:
+        from app.services.embedding_client import embedding_client as _emb
+        new_vec = await _emb.embed_single(content)
+        old_texts = [m.content or "" for m in existing]
+        old_vecs = await _emb.embed_batch(old_texts)
+        for m, old_vec in zip(existing, old_vecs):
+            if not old_vec:
+                continue
+            similarity = _cosine_sim(new_vec, old_vec)
+            if similarity > 0.75:
+                is_new_goal = await _llm_is_new_goal(content, m.content or "")
+                if is_new_goal:
+                    m.status = "pending_update"
+                    m.updated_at = _now()
+                    logger.info(f"任务 {task_id} LLM判定新目标替换旧目标 {m.memory_id}")
+                    break
+    except Exception as e:
+        logger.warning(f"任务目标判断 Embedding/LLM 不可用: {e}")
 
     return await _insert_memory(db, data)
+
+
+async def _llm_is_new_goal(new_content: str, old_content: str) -> bool:
+    """让 LLM 判断新任务记忆是否是更新旧目标（而非补充进展）。"""
+    try:
+        from app.services.llm_client import llm_client as _llm
+        prompt = f"""判断以下新任务记忆是否是"更新旧目标"，还是仅仅是"补充进展/待办/结论"。
+
+旧内容: {old_content[:300]}
+新内容: {new_content[:300]}
+
+如果是新的目标或方向性变化，旧目标应被替换，回答 YES。
+如果只是补充了更多细节、进展或待办，回答 NO。
+只回答 YES 或 NO。"""
+        resp = await _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
+        return "YES" in resp.upper()
+    except Exception:
+        return False
 
 
 def _content_overlap(a: str, b: str) -> float:
@@ -173,6 +341,7 @@ async def _insert_memory(db: AsyncSession, data: dict) -> Memory:
         entities=data.get("entities", []),
         status=data.get("status", "active"),
         version=data.get("version", 1),
+        replaced_by=data.get("replaced_by"),
         importance=data.get("importance", 0.5),
         confidence=data.get("confidence", 0.5),
         source_type=data.get("source_type", "extracted"),
@@ -319,7 +488,9 @@ async def build_context_query(db: AsyncSession, filters: dict) -> list[Memory]:
         if include_map.get("preferences"):
             type_conditions.append(Memory.memory_type == "preference")
         if include_map.get("facts"):
-            type_conditions.append(Memory.memory_type == "fact")
+            type_conditions.append(Memory.memory_type.in_(
+                ["fact", "decision", "constraint", "process", "correction"]
+            ))
         if include_map.get("task_state"):
             type_conditions.append(Memory.memory_type == "task_state")
         if type_conditions:
@@ -372,7 +543,7 @@ async def get_session_context(db: AsyncSession, session_id: str) -> dict:
 async def get_task_view(db: AsyncSession, task_id: str) -> dict:
     """任务视图：当前目标 + 进展时间线。"""
     all_memories = await search_local(db, {
-        "task_id": task_id, "memory_types": ["task_state"],
+        "task_id": task_id, "memory_types": ["task_state"], "status": "active",
     })
     all_memories.sort(key=lambda m: m.created_at or datetime.min)
 
@@ -382,12 +553,15 @@ async def get_task_view(db: AsyncSession, task_id: str) -> dict:
         "progress_timeline": [],
     }
     for m in all_memories:
-        if m.status == "active" and _is_task_goal(m.content or "", m.key_points or []):
-            view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
-        view["progress_timeline"].append({
+        sub_type = _classify_task(m.content or "", m.key_points or [])
+        entry = {
             "memory_id": m.memory_id, "content": m.content,
-            "status": m.status, "created_at": m.created_at.isoformat() if m.created_at else None,
-        })
+            "sub_type": sub_type,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        if sub_type == "goal":
+            view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
+        view["progress_timeline"].append(entry)
 
     return view
 

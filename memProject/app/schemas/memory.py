@@ -152,12 +152,6 @@ class WriteResultItem(BaseModel):
 class MemoryWriteResponse(BaseModel):
     """写入响应"""
     results: list[WriteResultItem] = Field(default_factory=list, description="每条消息的处理结果")
-    mode: str = Field(
-        "pipeline",
-        description="实际处理路径: pipeline(真实LLM流水线) / mock(正则提取) / "
-                    "mq(MQ伪同步) / mq_timeout(MQ等待超时降级) / degraded(Pipeline异常降级)。"
-                    "非 pipeline/mq 均为降级结果，测试与监控应告警",
-    )
 
 
 # ============================================================
@@ -207,8 +201,6 @@ class MemorySearchRequest(BaseModel):
     task_id: Optional[str] = Field(None)
     session_id: Optional[str] = Field(None)
     memory_types: Optional[list[str]] = Field(None, description="筛选类型: preference/fact/task/decision/constraint")
-    status: Optional[list[str]] = Field(None, description="按状态过滤: active/deleted/archived")
-    max_content_length: Optional[int] = Field(None, description="内容最大长度")
     top_k: int = Field(default=10, ge=1, le=50)
     time_start: Optional[datetime] = Field(None)
     time_end: Optional[datetime] = Field(None)
@@ -224,18 +216,20 @@ class ContextRequest(BaseModel):
     """上下文返回请求"""
     query: str = Field(..., description="当前用户问题")
     user_id: str = Field(..., description="用户标识")
+    agent_id: Optional[str] = Field(None)
     scene_id: Optional[str] = Field(None)
     task_id: Optional[str] = Field(None)
     session_id: Optional[str] = Field(None)
     max_tokens: int = Field(default=3000)
-    top_k: Optional[int] = Field(None, description="结果数量")
-    max_content_length: Optional[int] = Field(None, description="内容最大长度")
-    memory_types: Optional[list[str]] = Field(None, description="筛选类型")
-    status: Optional[list[str]] = Field(None, description="按状态过滤")
+    top_k: int = Field(default=10)
+    max_content_length: Optional[int] = Field(None)
     group_by_type: bool = Field(default=True)
+    memory_types: Optional[list[str]] = Field(None)
+    status: Optional[list[str]] = Field(None)
     include_preferences: bool = Field(default=True)
     include_facts: bool = Field(default=True)
     include_task_state: bool = Field(default=True)
+    rerank: bool = Field(default=False)
 
 
 # ============================================================

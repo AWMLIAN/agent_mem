@@ -698,102 +698,88 @@ async def memory_context(
     """
     Prompt 上下文。
 
-    基础层：memory_store.get_context() — Qdrant 语义检索 + 类型分组
-    增强层：有 task_id / session_id 时，额外附加三层聚合结果
+    三层聚合 — 不混入原始记忆碎片，仅返回结构化聚合结果 + LLM 总结。
     """
     try:
-        # 基础层：master 的语义检索上下文
-        result = await memory_store.get_context(
-            query=body.query,
-            user_id=body.user_id,
-            db=db,
-            agent_id=agent_id,
-            scene_id=body.scene_id,
-            task_id=body.task_id,
-            session_id=body.session_id,
-            max_tokens=body.max_tokens,
-            group_by_type=body.group_by_type,
-            top_k=body.top_k,
-            max_content_length=body.max_content_length,
-            memory_types=body.memory_types,
-            status=body.status,
-            include_preferences=body.include_preferences,
-            include_facts=body.include_facts,
-            include_task_state=body.include_task_state,
-        )
-        import logging as _lg; _lg.warning(f"DEBUG: get_context memory_count={result.get('memory_count')}, fragments={len(result.get('fragments', []))}, top_k={body.top_k}")
+        aggregation = {}
 
-        # 增强层：叠加上下文聚合（任务级/会话级/用户级）
         if body.task_id:
             task_view = await get_task_view(db, body.task_id)
-            if task_view.get("current_goal"):
-                result["fragments"].append({
-                    "memory_type": "task_goal",
-                    "content": task_view["current_goal"]["content"],
-                    "memory_ids": [task_view["current_goal"]["memory_id"]],
-                })
-            for item in task_view.get("progress_timeline", []):
-                result["fragments"].append({
-                    "memory_type": f"task_{item.get('status', 'progress')}",
-                    "content": item["content"],
-                    "memory_ids": [item["memory_id"]],
-                })
+            aggregation = {
+                "type": "task_view",
+                "task_id": body.task_id,
+                "goal": task_view["current_goal"]["content"] if task_view.get("current_goal") else "",
+                "timeline": [
+                    {"stage": item.get("sub_type", "progress"), "content": item["content"]}
+                    for item in task_view.get("progress_timeline", [])
+                ],
+            }
 
         elif body.session_id:
             sess_ctx = await get_session_context(db, body.session_id)
-            for item in sess_ctx.get("key_items", []):
-                result["fragments"].append({
-                    "memory_type": f"key_{item.get('memory_type', '')}",
-                    "content": item["content"],
-                    "memory_ids": [item["memory_id"]],
-                    "key": True,
-                })
+            by_type_clean = {
+                k: [item["content"] for item in v]
+                for k, v in sess_ctx.get("by_type", {}).items()
+            }
+            aggregation = {
+                "type": "session_context",
+                "session_id": body.session_id,
+                "by_type": by_type_clean,
+                "key_items": [
+                    {"type": item["memory_type"], "content": item["content"]}
+                    for item in sess_ctx.get("key_items", [])
+                ],
+            }
 
         elif body.include_preferences or body.include_facts:
             profile = await get_user_profile(db, body.user_id)
-            if body.include_preferences and profile.get("preferences"):
-                for pref in profile["preferences"]:
-                    result["fragments"].append({
-                        "memory_type": "preference", "content": pref, "memory_ids": []
-                    })
-            if body.include_facts and profile.get("facts"):
-                for fact in profile["facts"]:
-                    result["fragments"].append({
-                        "memory_type": "fact", "content": fact, "memory_ids": []
-                    })
+            aggregation = {
+                "type": "user_profile",
+                "user_id": body.user_id,
+                "preferences": profile.get("preferences", []),
+                "facts": profile.get("facts", []),
+            }
 
-        # Fire-and-forget 检索日志（仅记录基础层检索结果，不含增强层）
-        req_id = str(uuid4())
-        asyncio.create_task(_log_retrieval(
-            request_id=req_id,
-            agent_id=agent_id,
-            user_id=body.user_id,
-            scene_id=body.scene_id,
-            session_id=body.session_id,
-            task_id=body.task_id,
-            query_text=body.query,
-            filter_conditions={
-                "memory_types": body.memory_types,
-                "status": body.status,
-                "top_k": body.top_k,
-                "max_content_length": body.max_content_length,
-                "group_by_type": body.group_by_type,
-            },
-            top_k=body.top_k,
-            results=result.get("fragments", []),
-            elapsed_ms=0,
-        ))
+        # LLM 总结
+        formatted_text = ""
+        contents = []
+        for key, val in aggregation.items():
+            if key in ("preferences", "facts") and isinstance(val, list):
+                contents.extend(val)
+            elif key == "goal" and val:
+                contents.append(val)
+            elif key == "timeline" and isinstance(val, list):
+                contents.extend(item["content"] for item in val)
+            elif key == "by_type" and isinstance(val, dict):
+                for items in val.values():
+                    contents.extend(items)
+            elif key == "key_items" and isinstance(val, list):
+                contents.extend(item["content"] for item in val)
 
-        return ok(result)
+        if contents:
+            try:
+                from app.services.llm_client import llm_client as _llm
+                lines = "\n".join(f"- {c[:200]}" for c in contents[:20])
+                formatted_text = await _llm.chat_completion([{
+                    "role": "user",
+                    "content": f"将以下记忆碎片总结为一段通顺的摘要，注入AI对话上下文。保留关键信息，去除冗余：\n{lines}"
+                }], max_tokens=body.max_tokens or 500)
+            except Exception:
+                pass
+
+        return ok({
+            "aggregation": aggregation,
+            "formatted_text": formatted_text,
+            "estimated_tokens": len(formatted_text) // 2 if formatted_text else 0,
+        })
     except Exception as e:
         logger.error(f"Context generation failed: {e}")
         return error(
             message="上下文生成失败",
             code=-2,
             data={
+                "aggregation": {},
                 "formatted_text": "",
-                "fragments": [],
-                "memory_count": 0,
                 "estimated_tokens": 0,
             },
             error_code="CONTEXT_FAILED",
