@@ -259,25 +259,56 @@ def _is_task_goal(content: str, key_points: list) -> bool:
 
 
 async def _create_task_memory(db: AsyncSession, data: dict) -> Memory:
-    """任务记忆管理 — 区分目标与进展。"""
+    """任务记忆管理 — Embedding+LLM判断新目标替换旧目标。"""
     task_id = data.get("task_id")
     content = data.get("content", "")
-    key_points = data.get("key_points", [])
+    if not task_id or not content:
+        return await _insert_memory(db, data)
 
-    if task_id and _is_task_goal(content, key_points):
-        # 目标类：新目标替换旧目标，旧标记 pending_update
-        existing = await search_local(db, {
-            "task_id": task_id, "memory_types": ["task_state"], "status": "active",
-        })
-        old_goals = [m for m in existing if _is_task_goal(m.content or "", m.key_points or [])]
-        for m in old_goals:
-            m.status = "pending_update"
-            m.updated_at = _now()
-        if old_goals:
-            logger.info(f"任务 {task_id} 旧目标 {len(old_goals)} 条标记为 pending_update")
-    # 进展类：直接追加，保留历史链
+    existing = await search_local(db, {
+        "task_id": task_id, "memory_types": ["task_state"], "status": "active",
+    })
+    if not existing:
+        return await _insert_memory(db, data)
+
+    try:
+        from app.services.embedding_client import embedding_client as _emb
+        new_vec = await _emb.embed_single(content)
+        old_texts = [m.content or "" for m in existing]
+        old_vecs = await _emb.embed_batch(old_texts)
+        for m, old_vec in zip(existing, old_vecs):
+            if not old_vec:
+                continue
+            similarity = _cosine_sim(new_vec, old_vec)
+            if similarity > 0.75:
+                is_new_goal = await _llm_is_new_goal(content, m.content or "")
+                if is_new_goal:
+                    m.status = "pending_update"
+                    m.updated_at = _now()
+                    logger.info(f"任务 {task_id} LLM判定新目标替换旧目标 {m.memory_id}")
+                    break
+    except Exception as e:
+        logger.warning(f"任务目标判断 Embedding/LLM 不可用: {e}")
 
     return await _insert_memory(db, data)
+
+
+async def _llm_is_new_goal(new_content: str, old_content: str) -> bool:
+    """让 LLM 判断新任务记忆是否是更新旧目标（而非补充进展）。"""
+    try:
+        from app.services.llm_client import llm_client as _llm
+        prompt = f"""判断以下新任务记忆是否是"更新旧目标"，还是仅仅是"补充进展/待办/结论"。
+
+旧内容: {old_content[:300]}
+新内容: {new_content[:300]}
+
+如果是新的目标或方向性变化，旧目标应被替换，回答 YES。
+如果只是补充了更多细节、进展或待办，回答 NO。
+只回答 YES 或 NO。"""
+        resp = await _llm.chat_completion([{"role": "user", "content": prompt}], max_tokens=5)
+        return "YES" in resp.upper()
+    except Exception:
+        return False
 
 
 def _content_overlap(a: str, b: str) -> float:
