@@ -216,14 +216,20 @@ class ContextRequest(BaseModel):
     """上下文返回请求"""
     query: str = Field(..., description="当前用户问题")
     user_id: str = Field(..., description="用户标识")
+    agent_id: Optional[str] = Field(None)
     scene_id: Optional[str] = Field(None)
     task_id: Optional[str] = Field(None)
     session_id: Optional[str] = Field(None)
     max_tokens: int = Field(default=3000)
+    top_k: int = Field(default=10)
+    max_content_length: Optional[int] = Field(None)
     group_by_type: bool = Field(default=True)
+    memory_types: Optional[list[str]] = Field(None)
+    status: Optional[list[str]] = Field(None)
     include_preferences: bool = Field(default=True)
     include_facts: bool = Field(default=True)
     include_task_state: bool = Field(default=True)
+    rerank: bool = Field(default=False)
 
 
 # ============================================================
