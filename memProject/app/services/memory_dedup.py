@@ -210,12 +210,18 @@ class DedupService:
             return self._make_keep_new(candidate, "无相似向量匹配")
 
         # Stage 2: 从 PostgreSQL 加载完整记忆
-        hit_ids = [h["id"] for h in hits]
+        # 注意：Qdrant point id 是 _str_to_uuid(memory_id) 转换后的 UUID，
+        # 与 DB 的 memory_id（mem_xxx）不同，必须用 payload.memory_id 关联
+        hit_id_map = {}  # memory_id → score
+        for h in hits:
+            mem_id = (h.get("payload") or {}).get("memory_id") or str(h["id"])
+            hit_id_map[mem_id] = h["score"]
+
         existing_memories: list[Memory] = []
         try:
             result = await db.execute(
                 select(Memory).where(
-                    Memory.memory_id.in_(hit_ids),
+                    Memory.memory_id.in_(list(hit_id_map.keys())),
                     Memory.status.in_(["active", "pending"]),  # 仅匹配活跃/待验证记忆
                 )
             )
@@ -229,7 +235,7 @@ class DedupService:
 
         # 为每个已有记忆计算相似度
         similar_memories: list[SimilarMemory] = []
-        hit_score_map = {h["id"]: h["score"] for h in hits}
+        hit_score_map = hit_id_map
 
         for existing in existing_memories:
             vector_score = hit_score_map.get(existing.memory_id, 0.0)

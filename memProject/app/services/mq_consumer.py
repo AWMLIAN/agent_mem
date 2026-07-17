@@ -209,9 +209,80 @@ async def _dispatch_and_store(
 
         await session.commit()
 
-    # Mock 提取结果
-    from app.services.mock_extractor import mock_extract_results
-    return mock_extract_results(messages)
+    # 记忆提取：默认走真实 Pipeline（extract→generate→dedup→store），
+    # 仅当显式配置 use_mock_extraction=True 时使用开发期正则 Mock
+    if settings.generation.use_mock_extraction:
+        from app.services.mock_extractor import mock_extract_results
+        logger.warning(f"[Mock] Consumer 使用正则提取(非真实Pipeline): request_id={request_id}")
+        return mock_extract_results(messages)
+
+    text = _build_content_text(itype, body, messages)
+    if not text.strip():
+        return []
+
+    from app.services.memory_pipeline import memory_pipeline
+    async with async_session_factory() as pipe_session:
+        pipeline_result = await memory_pipeline.run(
+            text=text,
+            user_id=user_id,
+            agent_id=agent_id or None,
+            scene_id=body.get("scene_id"),
+            session_id=session_id_val,
+            task_id=body.get("task_id"),
+            extraction_types=["key_fact", "task_state", "decision"],
+            task_context=body.get("metadata"),
+            db=pipe_session,
+        )
+    return _pipeline_to_results(pipeline_result)
+
+
+def _build_content_text(itype: str, body: dict, messages: list) -> str:
+    """将消息体拼接为 Pipeline 输入文本（与 MemoryWriteRequest.get_content_text 对齐）"""
+    parts = []
+    for i, m in enumerate(messages):
+        parts.append(f"[{m.get('role', 'user')}](轮次{i + 1}): {m.get('content', '')}")
+    if itype == "session":
+        if body.get("session_summary"):
+            parts.append(f"[历史会话摘要]: {body['session_summary']}")
+        if body.get("session_source"):
+            parts.append(f"[会话来源]: {body['session_source']}")
+        if body.get("session_time"):
+            parts.append(f"[会话时间]: {body['session_time']}")
+    if itype == "task_process":
+        if body.get("task_goal"):
+            parts.append(f"[任务目标]: {body['task_goal']}")
+        if body.get("task_progress"):
+            parts.append(f"[任务进展]: {body['task_progress']}")
+        if body.get("task_result"):
+            parts.append(f"[执行结果]: {body['task_result']}")
+    return "\n".join(parts) if parts else ""
+
+
+def _pipeline_to_results(pipeline_result) -> list[dict]:
+    """
+    PipelineResult.details → [{id, memory, event}]。
+
+    映射规则（与 api/v1/memory._pipeline_to_write_results 一致）:
+      keep_new / update_existing → ADD
+      merge                      → MERGE
+      discard                    → SKIP
+      conflict                   → ADD（memory 前缀 [冲突] 标记）
+    """
+    results = []
+    for d in pipeline_result.details:
+        action = d.get("action", "keep_new")
+        memory_id = d.get("memory_id", "") or ""
+        content = d.get("content_preview", "") or ""
+
+        if action == "discard":
+            results.append({"id": "", "memory": content, "event": "SKIP"})
+        elif action == "merge":
+            results.append({"id": memory_id, "memory": content, "event": "MERGE"})
+        elif action == "conflict":
+            results.append({"id": memory_id, "memory": f"[冲突] {content}", "event": "ADD"})
+        else:  # keep_new / update_existing
+            results.append({"id": memory_id, "memory": content, "event": "ADD"})
+    return results
 
 
 # ============================================================

@@ -151,11 +151,12 @@ async def wait_for_result(request_id: str, timeout: float | None = None) -> list
 
 async def wait_for_result_with_timeout(
     request_id: str, timeout: float | None = None
-) -> list[dict]:
+) -> list[dict] | None:
     """
     带超时的等待 — 调用方使用此方法。
 
-    在 timeout 秒内等待结果，超时返回默认 SKIP 结果。
+    在 timeout 秒内等待结果；超时/Redis 不可用返回 None，
+    由调用方决定降级行为并在响应中标记（不再静默伪造 SKIP 结果）。
     """
     if timeout is None:
         timeout = settings.redis.result_poll_timeout
@@ -165,20 +166,13 @@ async def wait_for_result_with_timeout(
             wait_for_result(request_id, timeout=timeout),
             timeout=timeout + 0.5,  # 给内部一些余地
         )
-        if result is None:
-            return _default_skip_results()
         return result
     except asyncio.TimeoutError:
-        logger.info(f"等待结果超时 ({timeout}s): request_id={request_id}, 降级返回 SKIP")
-        return _default_skip_results()
+        logger.info(f"等待结果超时 ({timeout}s): request_id={request_id}, 交由调用方降级")
+        return None
     except Exception as e:
         logger.warning(f"等待结果异常: request_id={request_id}, error={e}")
-        return _default_skip_results()
-
-
-def _default_skip_results() -> list[dict]:
-    """返回默认 SKIP 结果"""
-    return [{"id": "", "memory": "", "event": "SKIP"}]
+        return None
 
 
 # 检查 Redis 是否可用
