@@ -89,7 +89,9 @@ generation:
   schedule_interval_minutes: 5
   max_memory_text_length: 2000
   max_summary_length: 500
-  use_mock_extraction: true
+  # ⚠ 共享配置保持 false！true 会让 /write 返回正则假结果（2026-07-17 测试事故根因）。
+  # 开发期需要 Mock 请在本地改动、勿提交，或用独立的 settings.local.yaml
+  use_mock_extraction: false
   use_mq_wait: false
 
 # 记忆压缩配置
