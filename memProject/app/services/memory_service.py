@@ -670,7 +670,7 @@ async def get_memory_stats(db: AsyncSession, user_id: str, scene_id: str | None 
             ).label("scope"),
             func.count().label("count"),
         )
-        .where(Memory.user_id == user_id, Memory.status != "deleted")
+        .where(Memory.user_id == user_id, Memory.status == "active")
     )
     if scene_id:
         query = query.where(Memory.scene_id == scene_id)
