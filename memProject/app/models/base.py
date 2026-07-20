@@ -181,6 +181,11 @@ class Memory(Base):
     last_used_at = Column(DateTime(timezone=True), nullable=True)
     decay_factor = Column(Float, default=1.0)
 
+    memory_scope = Column(
+        String(16), nullable=True, index=True,
+        comment="记忆层级/复用边界: user / session / task / agent",
+    )
+
     source_type = Column(String(32), default="extracted")
     source_record_ids = Column(JSON, default=list)
 
@@ -194,6 +199,9 @@ class Memory(Base):
         Index("idx_memory_task", "task_id", "status"),
         Index("idx_memory_session", "session_id", "status"),
         Index("idx_memory_status_time", "status", "created_at"),
+        # 记忆层级统计索引（对齐 memory_scope_v1）
+        Index("idx_memory_user_status_scope", "user_id", "status", "memory_scope"),
+        Index("idx_memory_user_scene_status_scope", "user_id", "scene_id", "status", "memory_scope"),
     )
 
 

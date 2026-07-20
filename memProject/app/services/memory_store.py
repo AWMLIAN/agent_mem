@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from sqlalchemy import select, delete, func, update
+from sqlalchemy import select, delete, func, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logger import get_logger
@@ -453,6 +453,43 @@ class MemoryStore:
             "page": page,
             "page_size": page_size,
         }
+
+    # ================================================================
+    # Count By Scope — 记忆层级分布统计
+    # ================================================================
+
+    async def count_by_scope(
+        self,
+        user_id: str,
+        db: AsyncSession,
+        scene_id: Optional[str] = None,
+        status: str = "active",
+    ) -> dict[str, int]:
+        """
+        按 memory_scope 分组统计用户记忆数量。
+
+        返回 {scope: count}，未出现的 scope 不会出现在 dict 中，调用方负责补齐。
+        统计条件与 list_memories 保持一致（默认仅统计 active），确保 stats.total == list.total。
+        """
+        # 构建过滤条件 — 与 list_memories 相同的 status 语义
+        conditions = [Memory.user_id == user_id, Memory.status == status]
+        if scene_id:
+            conditions.append(Memory.scene_id == scene_id)
+
+        from sqlalchemy import and_
+        stmt = (
+            select(Memory.memory_scope, func.count().label("count"))
+            .where(and_(*conditions))
+            .group_by(Memory.memory_scope)
+        )
+
+        result = await db.execute(stmt)
+        counts: dict[str, int] = {}
+        for row in result.fetchall():
+            scope = row.memory_scope
+            if scope:
+                counts[scope] = row.count
+        return counts
 
     # ================================================================
     # Delete All

@@ -199,3 +199,31 @@ async def verify_data_isolation(
     """验证数据隔离"""
     if not request_user_id or not request_user_id.strip():
         raise AuthenticationError("user_id 不能为空")
+
+
+async def authorize_user_access(
+    requested_user_id: str,
+    agent_id: str,
+    request: Request,
+) -> str:
+    """
+    验证调用方 agent 有权访问目标 user_id 的数据。
+
+    授权信任链：
+      1. agent 已通过 X-API-Key / JWT 在 get_current_agent 中完成身份认证
+      2. 生产阶段 agent 绑定 scene_id，数据隔离由 scene 维度保障
+      3. 开发阶段 (AUTH_ENABLED=False)：信任 query param（与 /memory/list 一致）
+
+    注意：本函数不依赖 X-User-Id Header（客户端可伪造）。
+    完整的 agent→user 细粒度权限映射需要引入独立的授权关系表。
+    """
+    if not settings.auth.enabled:
+        return requested_user_id
+
+    # 生产阶段：agent 已在 get_current_agent 中完成身份认证
+    # scene 级别的数据隔离由 get_current_agent 注入的 scene_id 保证
+    # 此处确保 user_id 非空（空 user_id 在 query 层已被 min_length=1 拦截）
+    if not requested_user_id or not requested_user_id.strip():
+        raise AuthorizationError("user_id 不能为空")
+
+    return requested_user_id
