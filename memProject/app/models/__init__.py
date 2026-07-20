@@ -12,7 +12,6 @@ from app.models.base import (
     RetrievalRequest,
     RetrievalResult,
     ApiLog,
-    DedupAudit,
 )
 
 __all__ = [
@@ -28,5 +27,4 @@ __all__ = [
     "RetrievalRequest",
     "RetrievalResult",
     "ApiLog",
-    "DedupAudit",
 ]

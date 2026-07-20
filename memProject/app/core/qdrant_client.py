@@ -28,7 +28,7 @@ def _str_to_uuid(s: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, s))
 
 QDRANT_HOST = "localhost"
-QDRANT_GRPC_PORT = 6333
+QDRANT_GRPC_PORT = 6334
 COLLECTION_NAME = "agent_mem_generation"  # 独立 collection，不影响 mem0 的 openmemory
 VECTOR_DIM = 1024  # bge-m3 维度
 DEFAULT_SCORE_THRESHOLD = 0.70
@@ -44,7 +44,7 @@ class QdrantClientSingleton:
     def initialize(self) -> bool:
         """初始化 Qdrant gRPC 连接并确保 collection 存在。"""
         try:
-            self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_GRPC_PORT, prefer_grpc=False)
+            self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_GRPC_PORT, prefer_grpc=True)
 
             # 确保 collection 存在
             collections = self._client.get_collections()
