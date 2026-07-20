@@ -394,6 +394,7 @@ class MemoryStore:
         task_id: Optional[str] = None,
         session_id: Optional[str] = None,
         memory_types: Optional[list[str]] = None,
+        memory_scope: Optional[str] = None,
         status: str = "active",
         page: int = 1,
         page_size: int = 20,
@@ -412,6 +413,8 @@ class MemoryStore:
             stmt = stmt.where(Memory.session_id == session_id)
         if memory_types:
             stmt = stmt.where(Memory.memory_type.in_(memory_types))
+        if memory_scope:
+            stmt = stmt.where(Memory.memory_scope == memory_scope)
 
         # Count
         count_stmt = select(func.count()).select_from(stmt.subquery())
@@ -443,6 +446,7 @@ class MemoryStore:
                 "scene_id": mem.scene_id,
                 "task_id": mem.task_id,
                 "session_id": mem.session_id,
+                "memory_scope": mem.memory_scope or "",
                 "created_at": mem.created_at.isoformat() if mem.created_at else None,
                 "updated_at": mem.updated_at.isoformat() if mem.updated_at else None,
             })

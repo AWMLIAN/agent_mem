@@ -247,10 +247,10 @@ def _classify_task(content: str, key_points: list) -> str:
     text = content + " " + " ".join(key_points or [])
     if any(kw in text for kw in _TASK_GOAL_KEYWORDS):
         return "goal"
-    if any(kw in text for kw in _TASK_CONCLUSION_KEYWORDS):
-        return "conclusion"
     if any(kw in text for kw in _TASK_PENDING_KEYWORDS):
         return "pending"
+    if any(kw in text for kw in _TASK_CONCLUSION_KEYWORDS):
+        return "conclusion"
     return "progress"
 
 
@@ -346,6 +346,7 @@ async def _insert_memory(db: AsyncSession, data: dict) -> Memory:
         confidence=data.get("confidence", 0.5),
         source_type=data.get("source_type", "extracted"),
         source_record_ids=data.get("source_record_ids", []),
+        memory_scope=data.get("memory_scope") or _infer_scope(data),
         vector_id=data.get("vector_id"),
         created_at=data.get("created_at", _now()),
         updated_at=data.get("updated_at", _now()),
@@ -543,25 +544,40 @@ async def get_session_context(db: AsyncSession, session_id: str) -> dict:
 async def get_task_view(db: AsyncSession, task_id: str) -> dict:
     """任务视图：当前目标 + 进展时间线。"""
     all_memories = await search_local(db, {
-        "task_id": task_id, "memory_types": ["task_state"], "status": "active",
+        "task_id": task_id, "status": "active",
     })
     all_memories.sort(key=lambda m: m.created_at or datetime.min)
 
     view: dict = {
         "task_id": task_id,
         "current_goal": None,
-        "progress_timeline": [],
+        "timeline": [],
+        "constraints": [],
+        "processes": [],
+        "decisions": [],
+        "facts": [],
     }
     for m in all_memories:
-        sub_type = _classify_task(m.content or "", m.key_points or [])
         entry = {
-            "memory_id": m.memory_id, "content": m.content,
-            "sub_type": sub_type,
+            "memory_id": m.memory_id,
+            "content": m.content,
+            "memory_type": m.memory_type,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
-        if sub_type == "goal":
-            view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
-        view["progress_timeline"].append(entry)
+        if m.memory_type == "task_state":
+            sub_type = _classify_task(m.content or "", m.key_points or [])
+            entry["sub_type"] = sub_type
+            if sub_type == "goal":
+                view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
+            view["timeline"].append(entry)
+        elif m.memory_type == "constraint":
+            view["constraints"].append(entry)
+        elif m.memory_type == "process":
+            view["processes"].append(entry)
+        elif m.memory_type == "decision":
+            view["decisions"].append(entry)
+        else:
+            view["facts"].append(entry)
 
     return view
 
@@ -639,6 +655,48 @@ async def get_stats(db: AsyncSession) -> dict:
         "total_users": total_users,
         "total_agents": total_agents,
         "total_sessions": total_sessions,
+    }
+
+
+def _infer_scope(data: dict) -> str:
+    """根据已有字段推断 memory_scope。"""
+    scope = data.get("memory_scope", "")
+    if scope in ("user", "session", "task", "agent"):
+        return scope
+    if data.get("task_id"):
+        return "task"
+    if data.get("session_id"):
+        return "session"
+    return "user"
+
+
+async def get_memory_stats(db: AsyncSession, user_id: str, scene_id: str | None = None) -> dict:
+    """层级统计：按 memory_scope 列 + user/session/task/agent 四级聚合。"""
+    query = (
+        select(
+            func.coalesce(Memory.memory_scope, "user").label("scope"),
+            func.count().label("count"),
+        )
+        .where(Memory.user_id == user_id, Memory.status == "active")
+    )
+    if scene_id:
+        query = query.where(Memory.scene_id == scene_id)
+    query = query.group_by("scope")
+
+    result = await db.execute(query)
+    rows = {row[0]: row[1] for row in result.fetchall()}
+
+    levels = ["user", "session", "task", "agent"]
+    counts = {lv: rows.get(lv, 0) for lv in levels}
+    total = sum(counts.values())
+
+    return {
+        "total": total,
+        "level_distribution": [
+            {"level": lv, "count": counts[lv],
+             "ratio": round(counts[lv] / total, 4) if total > 0 else 0.0}
+            for lv in levels
+        ],
     }
 
 
