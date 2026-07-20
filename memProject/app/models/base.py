@@ -112,6 +112,7 @@ class Task(Base):
     pending_items = Column(JSON, default=list)
     started_at = Column(DateTime(timezone=True), default=_now)
     ended_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
     extra_meta = Column(JSON, default=dict)
 
 
@@ -193,12 +194,14 @@ class Memory(Base):
 
     created_at = Column(DateTime(timezone=True), default=_now)
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+    deleted_at = Column(DateTime(timezone=True), nullable=True, default=None)
 
     __table_args__ = (
         Index("idx_memory_user_type_status", "user_id", "memory_type", "status"),
         Index("idx_memory_task", "task_id", "status"),
         Index("idx_memory_session", "session_id", "status"),
         Index("idx_memory_status_time", "status", "created_at"),
+        Index("idx_memory_deleted_at", "deleted_at"),
         # 记忆层级统计索引（对齐 memory_scope_v1）
         Index("idx_memory_user_status_scope", "user_id", "status", "memory_scope"),
         Index("idx_memory_user_scene_status_scope", "user_id", "scene_id", "status", "memory_scope"),
@@ -260,6 +263,7 @@ class RetrievalRequest(Base):
     filter_conditions = Column(JSON)
     top_k = Column(Integer, default=10)
     is_triggered = Column(Boolean, default=False)
+    retrieval_mode = Column(String(32), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), default=_now)
 
 
