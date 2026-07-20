@@ -32,12 +32,15 @@ import time as time_module
 from typing import Optional
 from uuid import uuid4
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
     DEFAULT_DEV_SCENE_ID,
+    authorize_user_access,
     get_current_agent,
     get_current_user_id,
     get_current_scene_id,
@@ -923,3 +926,94 @@ async def memory_delete_all(
         "message": store_result["message"],
         "deleted_count": store_result["deleted_count"],
     })
+
+
+# ============================================================
+# 记忆层级分布统计 — 对齐记忆层级统计接口交接文档
+# ============================================================
+
+SCOPE_LEVELS = ("user", "session", "task", "agent")
+CLASSIFICATION_VERSION = "memory_scope_v1"
+
+
+@router.get("/stats", summary="记忆层级分布统计")
+async def memory_stats(
+    request: Request,
+    user_id: str = Query(..., min_length=1, description="用户标识"),
+    scene_id: str | None = Query(None, description="场景过滤条件（可选）"),
+    db: AsyncSession = Depends(get_db),
+    agent_id: str = Depends(get_current_agent),
+):
+    """
+    统计指定用户在各记忆层级（user/session/task/agent）的分布。
+
+    返回 total、level_distribution（四项固定）、generated_at、classification_version。
+    统计条件与 /memory/list 保持一致，确保 stats.total == list.total。
+    默认只统计 status=active 的记录（与列表口径一致）。
+    """
+    start = time_module.perf_counter()
+    trace_id = f"trace_{uuid4().hex[:24]}"
+
+    try:
+        # 授权校验：agent 已在 get_current_agent 中通过 X-API-Key 认证
+        # 数据隔离由 agent 绑定的 scene_id 保障
+        await authorize_user_access(
+            requested_user_id=user_id,
+            agent_id=agent_id,
+            request=request,
+        )
+
+        # 聚合查询：单次 GROUP BY 完成，不循环查四次
+        # status="active" 与 /memory/list 默认口径一致，确保 stats.total == list.total
+        counts = await memory_store.count_by_scope(
+            user_id=user_id,
+            db=db,
+            scene_id=scene_id,
+            status="active",
+        )
+
+        # 补齐四项并计算 total / ratio
+        total = sum(counts.get(level, 0) for level in SCOPE_LEVELS)
+        distribution = [
+            {
+                "level": level,
+                "count": counts.get(level, 0),
+                "ratio": round(counts.get(level, 0) / total, 4) if total else 0,
+            }
+            for level in SCOPE_LEVELS
+        ]
+
+        elapsed_ms = int((time_module.perf_counter() - start) * 1000)
+
+        logger.info(
+            f"Stats: user={user_id}, scene={scene_id or '(none)'}, "
+            f"total={total}, elapsed={elapsed_ms}ms, trace_id={trace_id}"
+        )
+
+        return ok({
+            "total": total,
+            "level_distribution": distribution,
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "classification_version": CLASSIFICATION_VERSION,
+        })
+
+    except Exception as e:
+        elapsed_ms = int((time_module.perf_counter() - start) * 1000)
+        logger.error(
+            f"Stats query failed: user={user_id}, scene={scene_id or '(none)'}, "
+            f"elapsed={elapsed_ms}ms, trace_id={trace_id}, error={e}"
+        )
+        return error(
+            message="统计查询异常",
+            code=-1,
+            data={
+                "total": 0,
+                "level_distribution": [
+                    {"level": level, "count": 0, "ratio": 0}
+                    for level in SCOPE_LEVELS
+                ],
+                "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "classification_version": CLASSIFICATION_VERSION,
+            },
+            error_code="STATS_FAILED",
+        )
