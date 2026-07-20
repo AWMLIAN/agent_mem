@@ -672,11 +672,9 @@ def _infer_scope(data: dict) -> str:
 
 async def get_memory_stats(db: AsyncSession, user_id: str, scene_id: str | None = None) -> dict:
     """层级统计：按 memory_scope 列 + user/session/task/agent 四级聚合。"""
-    from sqlalchemy import coalesce
-
     query = (
         select(
-            coalesce(Memory.memory_scope, "user").label("scope"),
+            func.coalesce(Memory.memory_scope, "user").label("scope"),
             func.count().label("count"),
         )
         .where(Memory.user_id == user_id, Memory.status == "active")
