@@ -543,25 +543,40 @@ async def get_session_context(db: AsyncSession, session_id: str) -> dict:
 async def get_task_view(db: AsyncSession, task_id: str) -> dict:
     """任务视图：当前目标 + 进展时间线。"""
     all_memories = await search_local(db, {
-        "task_id": task_id, "memory_types": ["task_state"], "status": "active",
+        "task_id": task_id, "status": "active",
     })
     all_memories.sort(key=lambda m: m.created_at or datetime.min)
 
     view: dict = {
         "task_id": task_id,
         "current_goal": None,
-        "progress_timeline": [],
+        "timeline": [],
+        "constraints": [],
+        "processes": [],
+        "decisions": [],
+        "facts": [],
     }
     for m in all_memories:
-        sub_type = _classify_task(m.content or "", m.key_points or [])
         entry = {
-            "memory_id": m.memory_id, "content": m.content,
-            "sub_type": sub_type,
+            "memory_id": m.memory_id,
+            "content": m.content,
+            "memory_type": m.memory_type,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
-        if sub_type == "goal":
-            view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
-        view["progress_timeline"].append(entry)
+        if m.memory_type == "task_state":
+            sub_type = _classify_task(m.content or "", m.key_points or [])
+            entry["sub_type"] = sub_type
+            if sub_type == "goal":
+                view["current_goal"] = {"memory_id": m.memory_id, "content": m.content}
+            view["timeline"].append(entry)
+        elif m.memory_type == "constraint":
+            view["constraints"].append(entry)
+        elif m.memory_type == "process":
+            view["processes"].append(entry)
+        elif m.memory_type == "decision":
+            view["decisions"].append(entry)
+        else:
+            view["facts"].append(entry)
 
     return view
 

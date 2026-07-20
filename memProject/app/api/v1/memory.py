@@ -711,8 +711,12 @@ async def memory_context(
                 "goal": task_view["current_goal"]["content"] if task_view.get("current_goal") else "",
                 "timeline": [
                     {"stage": item.get("sub_type", "progress"), "content": item["content"]}
-                    for item in task_view.get("progress_timeline", [])
+                    for item in task_view.get("timeline", [])
                 ],
+                "constraints": [item["content"] for item in task_view.get("constraints", [])],
+                "processes": [item["content"] for item in task_view.get("processes", [])],
+                "decisions": [item["content"] for item in task_view.get("decisions", [])],
+                "facts": [item["content"] for item in task_view.get("facts", [])],
             }
 
         elif body.session_id:
