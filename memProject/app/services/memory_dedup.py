@@ -207,7 +207,17 @@ class DedupService:
             return self._make_keep_new(candidate, "向量检索失败，默认保留")
 
         if not hits:
-            return self._make_keep_new(candidate, "无相似向量匹配")
+            # 无重复：正常完成去重且确认无相似记忆 → 记录审计作为一次 completed keep_new
+            return self._make_keep_new(candidate, "无相似向量匹配", audit_data={
+                "candidate_content": candidate.content[:500],
+                "candidate_memory_type": candidate.memory_type,
+                "matched_memory_id": None,
+                "matched_content": None,
+                "vector_score": None,
+                "keyword_overlap": None,
+                "identity_match": False,
+                "composite_score": None,
+            })
 
         # Stage 2: 从 PostgreSQL 加载完整记忆
         # 注意：Qdrant point id 是 _str_to_uuid(memory_id) 转换后的 UUID，
