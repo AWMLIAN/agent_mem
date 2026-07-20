@@ -686,6 +686,27 @@ async def memory_search(
 
 
 # ============================================================
+# 层级统计 — 通用记忆建模与多层记忆管理
+# ============================================================
+
+@router.get("/stats", summary="层级记忆统计")
+async def memory_stats(
+    user_id: str = Query(...),
+    scene_id: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    """按 user/session/task/agent 四级统计。利用现有字段推断，不需要新增列。"""
+    from app.services.memory_service import get_memory_stats as _stats
+    from datetime import datetime as _dt, timezone as _tz
+
+    result = await _stats(db, user_id=user_id, scene_id=scene_id)
+    result["generated_at"] = _dt.now(_tz.utc).isoformat()
+    result["classification_version"] = "memory_scope_v1"
+    return ok(result)
+
+
+# ============================================================
 # 上下文 — 对齐前端对接文档 二.1 节
 # ============================================================
 

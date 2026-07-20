@@ -657,6 +657,42 @@ async def get_stats(db: AsyncSession) -> dict:
     }
 
 
+async def get_memory_stats(db: AsyncSession, user_id: str, scene_id: str | None = None) -> dict:
+    """层级统计：按 user/session/task/agent 四级聚合（利用现有字段推断）。"""
+    from sqlalchemy import case
+
+    query = (
+        select(
+            case(
+                (Memory.task_id.isnot(None) & (Memory.task_id != ""), "task"),
+                (Memory.session_id.isnot(None) & (Memory.session_id != ""), "session"),
+                else_="user",
+            ).label("scope"),
+            func.count().label("count"),
+        )
+        .where(Memory.user_id == user_id, Memory.status != "deleted")
+    )
+    if scene_id:
+        query = query.where(Memory.scene_id == scene_id)
+    query = query.group_by("scope")
+
+    result = await db.execute(query)
+    rows = {row[0]: row[1] for row in result.fetchall()}
+
+    levels = ["user", "session", "task", "agent"]
+    counts = {lv: rows.get(lv, 0) for lv in levels}
+    total = sum(counts.values())
+
+    return {
+        "total": total,
+        "level_distribution": [
+            {"level": lv, "count": counts[lv],
+             "ratio": round(counts[lv] / total, 4) if total > 0 else 0.0}
+            for lv in levels
+        ],
+    }
+
+
 async def get_memory_relations(db: AsyncSession, memory_id: str) -> list[dict]:
     result = await db.execute(
         select(MemoryRelation).where(
