@@ -346,6 +346,7 @@ async def _insert_memory(db: AsyncSession, data: dict) -> Memory:
         confidence=data.get("confidence", 0.5),
         source_type=data.get("source_type", "extracted"),
         source_record_ids=data.get("source_record_ids", []),
+        memory_scope=data.get("memory_scope") or _infer_scope(data),
         vector_id=data.get("vector_id"),
         created_at=data.get("created_at", _now()),
         updated_at=data.get("updated_at", _now()),
@@ -657,17 +658,25 @@ async def get_stats(db: AsyncSession) -> dict:
     }
 
 
+def _infer_scope(data: dict) -> str:
+    """根据已有字段推断 memory_scope。"""
+    scope = data.get("memory_scope", "")
+    if scope in ("user", "session", "task", "agent"):
+        return scope
+    if data.get("task_id"):
+        return "task"
+    if data.get("session_id"):
+        return "session"
+    return "user"
+
+
 async def get_memory_stats(db: AsyncSession, user_id: str, scene_id: str | None = None) -> dict:
-    """层级统计：按 user/session/task/agent 四级聚合（利用现有字段推断）。"""
-    from sqlalchemy import case
+    """层级统计：按 memory_scope 列 + user/session/task/agent 四级聚合。"""
+    from sqlalchemy import coalesce
 
     query = (
         select(
-            case(
-                (Memory.task_id.isnot(None) & (Memory.task_id != ""), "task"),
-                (Memory.session_id.isnot(None) & (Memory.session_id != ""), "session"),
-                else_="user",
-            ).label("scope"),
+            coalesce(Memory.memory_scope, "user").label("scope"),
             func.count().label("count"),
         )
         .where(Memory.user_id == user_id, Memory.status == "active")
