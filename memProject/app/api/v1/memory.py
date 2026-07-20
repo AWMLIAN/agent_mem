@@ -876,6 +876,8 @@ async def memory_list(
     user_id: str = Query(...),
     scene_id: str | None = Query(None),
     task_id: str | None = Query(None),
+    session_id: str | None = Query(None),
+    memory_scope: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -892,6 +894,8 @@ async def memory_list(
             db=db,
             scene_id=scene_id,
             task_id=task_id,
+            session_id=session_id,
+            memory_scope=memory_scope,
             page=page,
             page_size=page_size,
         )
