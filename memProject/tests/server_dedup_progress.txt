@@ -1,0 +1,30 @@
+Server Dedup Test [pass 1/2]: 126 conversations
+P1[10/126] elapsed=198s batch_rate=0.1/s avg_lat=19.4s ok=10 err=0 retries=0 | ADD=83 MERGE=2 SKIP=0 CONFLICT=1 | modes={'pipeline': 10}
+P1[20/126] elapsed=327s batch_rate=0.1/s avg_lat=12.4s ok=20 err=0 retries=0 | ADD=116 MERGE=3 SKIP=0 CONFLICT=1 | modes={'pipeline': 20}
+P1[30/126] elapsed=439s batch_rate=0.1/s avg_lat=10.7s ok=30 err=0 retries=0 | ADD=167 MERGE=3 SKIP=1 CONFLICT=1 | modes={'pipeline': 30}
+P1[40/126] elapsed=656s batch_rate=0.0/s avg_lat=21.2s ok=40 err=0 retries=0 | ADD=245 MERGE=7 SKIP=1 CONFLICT=1 | modes={'pipeline': 40}
+P1[50/126] elapsed=826s batch_rate=0.1/s avg_lat=16.5s ok=50 err=0 retries=0 | ADD=323 MERGE=8 SKIP=1 CONFLICT=1 | modes={'pipeline': 50}
+P1[60/126] elapsed=993s batch_rate=0.1/s avg_lat=16.2s ok=60 err=0 retries=0 | ADD=393 MERGE=10 SKIP=1 CONFLICT=1 | modes={'pipeline': 60}
+P1[70/126] elapsed=1141s batch_rate=0.1/s avg_lat=14.3s ok=70 err=0 retries=0 | ADD=448 MERGE=11 SKIP=1 CONFLICT=1 | modes={'pipeline': 70}
+P1[80/126] elapsed=1209s batch_rate=0.1/s avg_lat=6.3s ok=80 err=0 retries=0 | ADD=467 MERGE=16 SKIP=1 CONFLICT=1 | modes={'pipeline': 80}
+P1[90/126] elapsed=1258s batch_rate=0.2/s avg_lat=4.3s ok=90 err=0 retries=0 | ADD=478 MERGE=18 SKIP=1 CONFLICT=1 | modes={'pipeline': 90}
+P1[100/126] elapsed=1294s batch_rate=0.3/s avg_lat=3.1s ok=100 err=0 retries=0 | ADD=486 MERGE=18 SKIP=1 CONFLICT=2 | modes={'pipeline': 100}
+P1[110/126] elapsed=1343s batch_rate=0.2/s avg_lat=4.4s ok=110 err=0 retries=0 | ADD=498 MERGE=18 SKIP=1 CONFLICT=2 | modes={'pipeline': 110}
+P1[120/126] elapsed=1377s batch_rate=0.3/s avg_lat=2.9s ok=120 err=0 retries=0 | ADD=507 MERGE=18 SKIP=1 CONFLICT=2 | modes={'pipeline': 120}
+P1[126/126] elapsed=1415s batch_rate=0.2/s avg_lat=4.6s ok=126 err=0 retries=0 | ADD=520 MERGE=18 SKIP=1 CONFLICT=2 | modes={'pipeline': 126}
+Server Dedup Test [pass 2/2]: 126 conversations
+P2[10/126] elapsed=188s batch_rate=0.1/s avg_lat=18.3s ok=10 err=0 retries=0 | ADD=64 MERGE=18 SKIP=2 CONFLICT=0 | modes={'pipeline': 10}
+P2[20/126] elapsed=311s batch_rate=0.1/s avg_lat=11.8s ok=20 err=0 retries=0 | ADD=88 MERGE=28 SKIP=3 CONFLICT=0 | modes={'pipeline': 20}
+P2[30/126] elapsed=413s batch_rate=0.1/s avg_lat=9.8s ok=30 err=0 retries=0 | ADD=116 MERGE=35 SKIP=6 CONFLICT=0 | modes={'pipeline': 30}
+P2[40/126] elapsed=653s batch_rate=0.0/s avg_lat=23.5s ok=40 err=0 retries=0 | ADD=202 MERGE=52 SKIP=7 CONFLICT=0 | modes={'pipeline': 40}
+P2[50/126] elapsed=848s batch_rate=0.1/s avg_lat=19.0s ok=50 err=0 retries=0 | ADD=275 MERGE=67 SKIP=12 CONFLICT=0 | modes={'pipeline': 50}
+P2[60/126] elapsed=988s batch_rate=0.1/s avg_lat=13.5s ok=60 err=0 retries=0 | ADD=317 MERGE=77 SKIP=14 CONFLICT=0 | modes={'pipeline': 60}
+P2[70/126] elapsed=1129s batch_rate=0.1/s avg_lat=13.6s ok=70 err=0 retries=0 | ADD=356 MERGE=86 SKIP=18 CONFLICT=0 | modes={'pipeline': 70}
+P2[80/126] elapsed=1192s batch_rate=0.2/s avg_lat=5.7s ok=80 err=0 retries=0 | ADD=368 MERGE=92 SKIP=18 CONFLICT=0 | modes={'pipeline': 80}
+P2[90/126] elapsed=1245s batch_rate=0.2/s avg_lat=4.8s ok=90 err=0 retries=0 | ADD=381 MERGE=98 SKIP=18 CONFLICT=0 | modes={'pipeline': 90}
+P2[100/126] elapsed=1281s batch_rate=0.3/s avg_lat=3.1s ok=100 err=0 retries=0 | ADD=383 MERGE=101 SKIP=19 CONFLICT=2 | modes={'pipeline': 100}
+P2[110/126] elapsed=1329s batch_rate=0.2/s avg_lat=4.3s ok=110 err=0 retries=0 | ADD=393 MERGE=103 SKIP=19 CONFLICT=4 | modes={'pipeline': 110}
+P2[120/126] elapsed=1369s batch_rate=0.3/s avg_lat=3.5s ok=120 err=0 retries=0 | ADD=401 MERGE=106 SKIP=19 CONFLICT=4 | modes={'pipeline': 120}
+P2[126/126] elapsed=1408s batch_rate=0.2/s avg_lat=4.6s ok=126 err=0 retries=0 | ADD=407 MERGE=109 SKIP=21 CONFLICT=4 | modes={'pipeline': 126}
+
+Done. passes=2
