@@ -151,6 +151,7 @@ class WriteResultItem(BaseModel):
 
 class MemoryWriteResponse(BaseModel):
     """写入响应"""
+    mode: str = Field(default="legacy", description="处理路径：pipeline|mock|mq|mq_timeout|degraded")
     results: list[WriteResultItem] = Field(default_factory=list, description="每条消息的处理结果")
 
 
