@@ -247,10 +247,10 @@ def _classify_task(content: str, key_points: list) -> str:
     text = content + " " + " ".join(key_points or [])
     if any(kw in text for kw in _TASK_GOAL_KEYWORDS):
         return "goal"
-    if any(kw in text for kw in _TASK_CONCLUSION_KEYWORDS):
-        return "conclusion"
     if any(kw in text for kw in _TASK_PENDING_KEYWORDS):
         return "pending"
+    if any(kw in text for kw in _TASK_CONCLUSION_KEYWORDS):
+        return "conclusion"
     return "progress"
 
 
