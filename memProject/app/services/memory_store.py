@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from sqlalchemy import select, delete, func, text, update
+from sqlalchemy import select, delete, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logger import get_logger
@@ -38,6 +38,7 @@ async def _log_retrieval(
     filter_conditions: dict,
     top_k: int,
     results: list[dict],
+    retrieval_mode: str = "hybrid",
 ) -> None:
     """fire-and-forget 写入检索请求和结果到 T_RETRIEVAL_REQUEST / T_RETRIEVAL_RESULT。"""
     try:
@@ -52,6 +53,7 @@ async def _log_retrieval(
                 query_text=query,
                 filter_conditions=filter_conditions,
                 top_k=top_k,
+                retrieval_mode=retrieval_mode,
             )
             session.add(req)
 
@@ -265,6 +267,7 @@ class MemoryStore:
                 filter_conditions=filter_conditions,
                 top_k=top_k,
                 results=results,
+                retrieval_mode="hybrid",
             )
         )
 
@@ -371,6 +374,7 @@ class MemoryStore:
                 filter_conditions=filter_conditions,
                 top_k=top_k,
                 results=results,
+                retrieval_mode="keyword",
             )
         )
 
@@ -453,43 +457,6 @@ class MemoryStore:
             "page": page,
             "page_size": page_size,
         }
-
-    # ================================================================
-    # Count By Scope — 记忆层级分布统计
-    # ================================================================
-
-    async def count_by_scope(
-        self,
-        user_id: str,
-        db: AsyncSession,
-        scene_id: Optional[str] = None,
-        status: str = "active",
-    ) -> dict[str, int]:
-        """
-        按 memory_scope 分组统计用户记忆数量。
-
-        返回 {scope: count}，未出现的 scope 不会出现在 dict 中，调用方负责补齐。
-        统计条件与 list_memories 保持一致（默认仅统计 active），确保 stats.total == list.total。
-        """
-        # 构建过滤条件 — 与 list_memories 相同的 status 语义
-        conditions = [Memory.user_id == user_id, Memory.status == status]
-        if scene_id:
-            conditions.append(Memory.scene_id == scene_id)
-
-        from sqlalchemy import and_
-        stmt = (
-            select(Memory.memory_scope, func.count().label("count"))
-            .where(and_(*conditions))
-            .group_by(Memory.memory_scope)
-        )
-
-        result = await db.execute(stmt)
-        counts: dict[str, int] = {}
-        for row in result.fetchall():
-            scope = row.memory_scope
-            if scope:
-                counts[scope] = row.count
-        return counts
 
     # ================================================================
     # Delete All
@@ -695,6 +662,10 @@ class MemoryStore:
             memory.summary = summary
         if status is not None:
             memory.status = status
+            if status == "deleted" and memory.deleted_at is None:
+                memory.deleted_at = datetime.now(timezone.utc)
+            elif status == "active" and memory.deleted_at is not None:
+                memory.deleted_at = None
         if importance is not None:
             memory.importance = max(0.0, min(1.0, importance))
         if confidence is not None:
@@ -750,8 +721,7 @@ class MemoryStore:
 
         previous_status = memory.status
         memory.status = "deleted"
-        memory.extra_meta = memory.extra_meta or {}
-        memory.extra_meta["delete_reason"] = reason or "用户要求"
+        memory.deleted_at = datetime.now(timezone.utc)
         memory.updated_at = datetime.now(timezone.utc)
 
         await db.commit()
@@ -788,14 +758,17 @@ class MemoryStore:
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
 
-        # 统计待清理
+        # 统计待清理：优先使用 deleted_at，迁移遗留记录回退到 updated_at
+        time_condition = (
+            (Memory.deleted_at.isnot(None)) & (Memory.deleted_at < cutoff)
+        ) | (
+            (Memory.deleted_at.is_(None)) & (Memory.updated_at < cutoff)
+        )
+
         count_stmt = (
             select(func.count())
             .select_from(Memory)
-            .where(
-                Memory.status == "deleted",
-                Memory.updated_at < cutoff,
-            )
+            .where(Memory.status == "deleted", time_condition)
         )
         total = (await db.execute(count_stmt)).scalar() or 0
 
@@ -803,13 +776,7 @@ class MemoryStore:
             return {"deleted": 0, "total_candidates": total, "dry_run": dry_run}
 
         # 物理删除
-        delete_stmt = (
-            delete(Memory)
-            .where(
-                Memory.status == "deleted",
-                Memory.updated_at < cutoff,
-            )
-        )
+        delete_stmt = delete(Memory).where(Memory.status == "deleted", time_condition)
         result = await db.execute(delete_stmt)
         await db.commit()
 
@@ -818,15 +785,11 @@ class MemoryStore:
         # 同步清理 Qdrant（尽力而为）
         if self.qdrant.is_available and deleted_count > 0:
             try:
-                ids_stmt = (
-                    select(Memory.memory_id)
-                    .where(
-                        Memory.status == "deleted",
-                        Memory.updated_at < cutoff,
-                    )
+                ids_stmt = select(Memory.memory_id).where(
+                    Memory.status == "deleted", time_condition
                 )
                 remaining = (await db.execute(ids_stmt)).scalars().all()
-                if not remaining:
+                if remaining:
                     self.qdrant.delete_vectors(list(remaining))
             except Exception as e:
                 logger.warning(f"Qdrant purge failed (non-fatal): {e}")

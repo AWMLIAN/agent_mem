@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """管理后台 API — 5 个接口。"""
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_agent
+from app.api.deps import get_current_agent, require_admin
 from app.core.database import get_db
 from app.schemas.common import ok
 from app.models.base import RetrievalRequest, ApiLog
+from app.services.dashboard_service import get_dashboard_data
 from app.services.memory_service import (
     get_memory_by_id,
     get_memory_relations,
@@ -93,6 +96,41 @@ async def admin_retrieval_logs(
 @router.get("/stats", summary="系统统计概览")
 async def admin_stats(db: AsyncSession = Depends(get_db), _admin: str = Depends(get_current_agent)):
     return ok(await get_stats(db))
+
+
+@router.get("/dashboard", summary="系统总览 Dashboard")
+async def admin_dashboard(
+    hours: int = Query(default=24, description="统计窗口小时数 (1-168)"),
+    trend_days: int = Query(default=7, description="按日趋势天数 (1-90)"),
+    db: AsyncSession = Depends(get_db),
+    _admin: str = Depends(require_admin),
+):
+    """返回系统总览聚合数据：summary、comparison、memory_trend、memory_type_distribution。"""
+    # 手动参数校验（协作文档要求 HTTP 400，非默认 422）
+    err_body = {"code": -1, "message": "", "error_code": "INVALID_ARGUMENT", "data": None}
+    if not (1 <= hours <= 168):
+        err_body["message"] = "hours 取值范围 1-168"
+        return JSONResponse(status_code=400, content=err_body)
+    if not (1 <= trend_days <= 90):
+        err_body["message"] = "trend_days 取值范围 1-90"
+        return JSONResponse(status_code=400, content=err_body)
+
+    trace_id = uuid.uuid4().hex[:16]
+    try:
+        data = await get_dashboard_data(db, hours=hours, trend_days=trend_days)
+        return ok(data.model_dump(mode="json"))
+    except Exception:
+        from app.core.logger import get_logger
+        logger = get_logger("admin")
+        logger.exception(f"Dashboard query failed [trace_id={trace_id}]")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": -1, "message": "Dashboard 查询异常",
+                "data": None, "error_code": "DASHBOARD_FAILED",
+                "trace_id": trace_id,
+            },
+        )
 
 
 @router.get("/api-logs", summary="接口调用日志")

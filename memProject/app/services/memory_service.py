@@ -378,6 +378,7 @@ async def soft_delete_memory(db: AsyncSession, memory_id: str) -> tuple[str, str
 
     previous_status = memory.status
     memory.status = "deleted"
+    memory.deleted_at = _now()
     memory.updated_at = _now()
     await db.flush()
     return memory_id, previous_status
