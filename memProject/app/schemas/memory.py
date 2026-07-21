@@ -208,6 +208,8 @@ class MemorySearchRequest(BaseModel):
     time_end: Optional[datetime] = Field(None)
     include_scores: bool = Field(default=True)
     rerank: bool = Field(default=True, description="启用 Reranker 二次排序（+150-200ms，默认开启）")
+    status: Optional[list[str]] = Field(None, description="筛选状态，不传默认只查 active")
+    max_content_length: Optional[int] = Field(None, description="返回内容最大字符数，超出截断")
 
 
 # ============================================================

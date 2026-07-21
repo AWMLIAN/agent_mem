@@ -101,6 +101,7 @@ async def _log_retrieval(
     top_k: int,
     results: list[dict],
     elapsed_ms: int,
+    retrieval_mode: str = "hybrid",
 ):
     """异步写检索日志，失败不阻塞主流程。"""
     try:
@@ -115,6 +116,7 @@ async def _log_retrieval(
                 query_text=query_text,
                 filter_conditions=filter_conditions,
                 top_k=top_k,
+                retrieval_mode=retrieval_mode,
             ))
             await log_db.flush()
 
@@ -725,6 +727,7 @@ async def memory_search(
             top_k=body.top_k,
             results=result.get("results", []),
             elapsed_ms=result.get("elapsed_ms", 0),
+            retrieval_mode="hybrid",
         ))
 
         return ok(result)

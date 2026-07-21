@@ -201,6 +201,26 @@ async def verify_data_isolation(
         raise AuthenticationError("user_id 不能为空")
 
 
+async def require_admin(
+    request: Request,
+    agent_id: str = Depends(get_current_agent),
+    db: AsyncSession = Depends(get_db),
+) -> str:
+    """管理员鉴权依赖 — 仅允许管理员访问。"""
+    if not settings.auth.enabled:
+        return agent_id
+    result = await db.execute(
+        select(Agent).where(Agent.agent_id == agent_id)
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise AuthenticationError("智能体不存在")
+    permissions = agent.permissions or []
+    if "admin" not in permissions:
+        raise AuthorizationError("管理员权限不足")
+    return agent_id
+
+
 async def authorize_user_access(
     requested_user_id: str,
     agent_id: str,

@@ -38,6 +38,7 @@ async def _log_retrieval(
     filter_conditions: dict,
     top_k: int,
     results: list[dict],
+    retrieval_mode: str = "hybrid",
 ) -> None:
     """fire-and-forget 写入检索请求和结果到 T_RETRIEVAL_REQUEST / T_RETRIEVAL_RESULT。"""
     try:
@@ -52,6 +53,7 @@ async def _log_retrieval(
                 query_text=query,
                 filter_conditions=filter_conditions,
                 top_k=top_k,
+                retrieval_mode=retrieval_mode,
             )
             session.add(req)
 
@@ -265,6 +267,7 @@ class MemoryStore:
                 filter_conditions=filter_conditions,
                 top_k=top_k,
                 results=results,
+                retrieval_mode="hybrid",
             )
         )
 
@@ -371,6 +374,7 @@ class MemoryStore:
                 filter_conditions=filter_conditions,
                 top_k=top_k,
                 results=results,
+                retrieval_mode="keyword",
             )
         )
 
@@ -699,6 +703,10 @@ class MemoryStore:
             memory.summary = summary
         if status is not None:
             memory.status = status
+            if status == "deleted" and memory.deleted_at is None:
+                memory.deleted_at = datetime.now(timezone.utc)
+            elif status == "active" and memory.deleted_at is not None:
+                memory.deleted_at = None
         if importance is not None:
             memory.importance = max(0.0, min(1.0, importance))
         if confidence is not None:
@@ -754,8 +762,7 @@ class MemoryStore:
 
         previous_status = memory.status
         memory.status = "deleted"
-        memory.extra_meta = memory.extra_meta or {}
-        memory.extra_meta["delete_reason"] = reason or "用户要求"
+        memory.deleted_at = datetime.now(timezone.utc)
         memory.updated_at = datetime.now(timezone.utc)
 
         await db.commit()
@@ -798,7 +805,8 @@ class MemoryStore:
             .select_from(Memory)
             .where(
                 Memory.status == "deleted",
-                Memory.updated_at < cutoff,
+                (Memory.deleted_at.isnot(None)) & (Memory.deleted_at < cutoff)
+                | (Memory.deleted_at.is_(None)) & (Memory.updated_at < cutoff),
             )
         )
         total = (await db.execute(count_stmt)).scalar() or 0
@@ -830,7 +838,7 @@ class MemoryStore:
                     )
                 )
                 remaining = (await db.execute(ids_stmt)).scalars().all()
-                if not remaining:
+                if remaining:
                     self.qdrant.delete_vectors(list(remaining))
             except Exception as e:
                 logger.warning(f"Qdrant purge failed (non-fatal): {e}")
