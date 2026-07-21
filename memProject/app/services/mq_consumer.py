@@ -263,7 +263,8 @@ def _pipeline_to_results(pipeline_result) -> list[dict]:
     PipelineResult.details → [{id, memory, event}]。
 
     映射规则（与 api/v1/memory._pipeline_to_write_results 一致）:
-      keep_new / update_existing → ADD
+      keep_new                   → ADD
+      update_existing            → UPDATE
       merge                      → MERGE
       discard                    → SKIP
       conflict                   → ADD（memory 前缀 [冲突] 标记）
@@ -280,7 +281,9 @@ def _pipeline_to_results(pipeline_result) -> list[dict]:
             results.append({"id": memory_id, "memory": content, "event": "MERGE"})
         elif action == "conflict":
             results.append({"id": memory_id, "memory": f"[冲突] {content}", "event": "ADD"})
-        else:  # keep_new / update_existing
+        elif action == "update_existing":
+            results.append({"id": memory_id, "memory": content, "event": "UPDATE"})
+        else:  # keep_new
             results.append({"id": memory_id, "memory": content, "event": "ADD"})
     return results
 

@@ -422,7 +422,7 @@ def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
     映射规则:
       keep_new        → ADD      (新记忆创建)
       merge           → MERGE    (合并到已有)
-      update_existing → ADD      (更新视为新增信息)
+      update_existing → UPDATE   (更新已有记忆)
       discard         → SKIP     (重复或不包含新信息)
       conflict        → CONFLICT (冲突需人工确认)
     """
@@ -451,7 +451,13 @@ def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
                 memory=f"[冲突] {content}",
                 event=MemoryEvent.ADD,  # 仍写入但标记为 pending
             ))
-        else:  # keep_new / update_existing
+        elif action == "update_existing":
+            results.append(WriteResultItem(
+                id=memory_id,
+                memory=content,
+                event=MemoryEvent.UPDATE,
+            ))
+        else:  # keep_new
             results.append(WriteResultItem(
                 id=memory_id,
                 memory=content,

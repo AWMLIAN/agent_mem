@@ -138,6 +138,7 @@ class MemoryWriteRequest(BaseModel):
 class MemoryEvent(str, Enum):
     """记忆事件类型"""
     ADD = "ADD"       # 新增记忆
+    UPDATE = "UPDATE" # 更新已有记忆
     SKIP = "SKIP"     # 跳过（无价值信息）
     MERGE = "MERGE"   # 合并到已有记忆
 
@@ -146,7 +147,7 @@ class WriteResultItem(BaseModel):
     """单条写入结果（对齐前端文档 results 数组元素）"""
     id: str = Field(..., description="记忆 ID")
     memory: str = Field(..., description="记忆内容摘要")
-    event: MemoryEvent = Field(..., description="事件: ADD / SKIP / MERGE")
+    event: MemoryEvent = Field(..., description="事件: ADD / UPDATE / SKIP / MERGE")
 
 
 class MemoryWriteResponse(BaseModel):
