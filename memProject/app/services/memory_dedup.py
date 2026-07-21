@@ -199,8 +199,8 @@ class DedupService:
             hits = self._qdrant.search_similar(
                 query_vector=query_vector,
                 user_id=user_id,
-                top_k=5,
-                score_threshold=0.70,
+                top_k=8,
+                score_threshold=0.65,
             )
         except Exception as e:
             logger.warning(f"Vector search failed for dedup: {e}")
@@ -531,14 +531,14 @@ class DedupService:
         """
         基于综合评分决定去重动作。
 
-        决策矩阵（v2）：
+        决策矩阵（v2 tuned）：
           composite = 0.5 * vector_score + 0.3 * keyword_overlap + 0.2 * identity_bonus
 
           composite >= 0.90 + identity     → DISCARD (近乎重复)
-          composite >= 0.80 + identity     → UPDATE_EXISTING (明确更新)
-          composite >= 0.85 + conflict     → CONFLICT (潜在冲突)
-          composite >= 0.65 + !identity    → MERGE (相似但不同主体)
-          composite < 0.65                 → KEEP_NEW
+          composite >= 0.78 + identity     → UPDATE_EXISTING (明确更新)
+          composite >= 0.80 + conflict     → CONFLICT (潜在冲突)
+          composite >= 0.55 + !identity    → MERGE (相似但不同主体)
+          composite < 0.55                 → KEEP_NEW
 
         新增 CONFLICT 路径：高相似度 + 存在冲突信号 → CONFLICT
         """
@@ -575,9 +575,9 @@ class DedupService:
         # 标准决策路径
         if composite >= 0.90:
             return DedupAction.DISCARD
-        elif composite >= 0.80 and identity_match:
+        elif composite >= 0.78 and identity_match:
             return DedupAction.UPDATE_EXISTING
-        elif composite >= 0.65:
+        elif composite >= 0.55:
             return DedupAction.MERGE
         else:
             return DedupAction.KEEP_NEW
