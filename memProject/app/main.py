@@ -37,6 +37,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Database connection OK")
         await create_pgvector_extension()
 
+    # 初始化 mem0 客户端
+    try:
+        mem0_ok = mem0_client.initialize()
+        if mem0_ok:
+            logger.info("mem0 client initialized OK")
+        else:
+            logger.warning("mem0 client init failed — mem0 双写降级")
+    except Exception as e:
+        logger.warning(f"mem0 client init failed (non-fatal): {e}")
+
     # 尝试启动 MQ Producer（可选，Kafka 不可用时不影响服务）
     try:
         from app.services.mq_producer import mq_producer

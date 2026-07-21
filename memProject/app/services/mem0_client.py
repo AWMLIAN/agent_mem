@@ -74,11 +74,12 @@ class Mem0Client:
             raise ServiceDegradedError("mem0 未初始化，记忆写入/检索服务降级中")
 
     def add(self, messages: list[dict], *, user_id: str, agent_id: Optional[str] = None,
-                  session_id: Optional[str] = None, metadata: Optional[dict] = None) -> list[dict]:
+                  session_id: Optional[str] = None, metadata: Optional[dict] = None,
+                  infer: bool = False) -> list[dict]:
         self._check()
-        kwargs = {"user_id": user_id, "metadata": metadata or {}}
+        kwargs = {"user_id": user_id, "metadata": metadata or {}, "infer": infer}
         if agent_id: kwargs["agent_id"] = agent_id
-        if session_id: kwargs["session_id"] = session_id
+        # session_id 通过 metadata 传递，不传顶层参数（当前 mem0 版本不支持）
         try:
             result = self.client.add(messages, **kwargs)
             logger.info(f"mem0 add: user={user_id}, msgs={len(messages)}")

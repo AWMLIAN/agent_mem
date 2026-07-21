@@ -34,7 +34,7 @@ mem0:
       port: 6333
       grpc_port: 6333
       embedding_model_dims: 1024
-      collection_name: "openmemory"
+      collection_name: "agent_mem_generation"
   history_store:
     provider: "postgresql"
     config:

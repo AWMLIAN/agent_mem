@@ -67,6 +67,7 @@ from app.schemas.memory import (
     MemoryWriteResponse,
     WriteResultItem,
 )
+from app.services.mem0_client import mem0_client
 from app.services.memory_pipeline import memory_pipeline
 from app.services.memory_store import memory_store
 from app.services.memory_service import (
@@ -312,17 +313,6 @@ async def memory_write(
         f"discarded={pipeline_result.discarded_count}, elapsed={elapsed}ms"
     )
 
-    # 异步双写到 mem0（fire-and-forget，失败不阻塞响应）
-    background_tasks.add_task(
-        _sync_pipeline_to_mem0,
-        pipeline_result=pipeline_result,
-        user_id=effective_user_id,
-        agent_id=agent_id,
-        scene_id=effective_scene_id,
-        session_id=effective_session_id,
-        task_id=effective_task_id,
-    )
-
     return ok(MemoryWriteResponse(results=results, mode="pipeline").model_dump())
 
 
@@ -422,60 +412,6 @@ async def _batch_write_records(
 
     if records:
         await db.execute(insert(InteractionRecord), records)
-
-
-# ============================================================
-# mem0 异步双写
-# ============================================================
-
-def _sync_pipeline_to_mem0(
-    pipeline_result,
-    user_id: str,
-    agent_id: str,
-    scene_id: str | None,
-    session_id: str | None,
-    task_id: str | None,
-) -> None:
-    """
-    Pipeline 写入完成后，异步同步每条记忆到 mem0。
-    所有 ID 字段和结构化元数据传入 metadata。
-    失败仅打 warning，绝不影响主链路。
-    """
-    from app.services.mem0_client import mem0_client as _mem0
-    if not _mem0.is_available:
-        logger.debug("mem0 未初始化，跳过 mem0 双写")
-        return
-
-    created_at = datetime.now(timezone.utc).isoformat()
-
-    for detail in pipeline_result.details:
-        action = detail.get("action", "")
-        if action in ("discard",):
-            continue
-
-        metadata = {
-            "scene_id": scene_id,
-            "task_id": task_id,
-            "memory_type": detail.get("memory_type", "fact"),
-            "importance": detail.get("importance", 0.5),
-            "confidence": detail.get("confidence", 0.5),
-            "created_at": created_at,
-        }
-
-        content = detail.get("content_preview", "")
-        memory_id = detail.get("memory_id") or ""
-
-        try:
-            _mem0.add(
-                messages=[{"role": "user", "content": content}],
-                user_id=user_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                metadata=metadata,
-            )
-            logger.debug(f"mem0 sync OK: memory_id={memory_id}")
-        except Exception as e:
-            logger.warning(f"mem0 sync failed (non-fatal): memory_id={memory_id}, err={e}")
 
 
 # ============================================================
@@ -679,33 +615,114 @@ async def memory_search(
     agent_id: str = Depends(get_current_agent),
 ):
     """
-    语义检索历史记忆 — Qdrant 向量检索 + PostgreSQL 元数据过滤。
+    语义检索历史记忆 — mem0 三路混合检索（语义 + BM25 + 实体）+ Qdrant 层全字段过滤（已启用 v2）。
 
-    返回与 query 最相关的记忆列表，包含 relevance_score。
-    当 Qdrant 不可用时，降级为数据库关键词匹配。
+    mem0 在 Qdrant 层完成所有过滤（user_id / scene_id / task_id / session_id /
+    memory_type / status / created_at 时间范围），无需 PG 后过滤。
+
+    当 mem0 不可用时，降级为 memory_store 路径。
     """
-    from app.services.retrieval_service import search as legacy_search
+    t0 = time_module.perf_counter()
+
+    # ── 构建 mem0 filters ──
+    filters: dict = {}
+
+    if body.scene_id:
+        filters["scene_id"] = body.scene_id
+    if body.task_id:
+        filters["task_id"] = body.task_id
+    if body.session_id:
+        filters["session_id"] = body.session_id
+    if body.memory_types:
+        filters["memory_type"] = {"in": body.memory_types}
+    if body.status:
+        filters["status"] = {"in": body.status}
+
+    # 时间范围过滤
+    time_filter: dict = {}
+    if body.time_start:
+        time_filter["gte"] = body.time_start.isoformat() if hasattr(body.time_start, "isoformat") else str(body.time_start)
+    if body.time_end:
+        time_filter["lte"] = body.time_end.isoformat() if hasattr(body.time_end, "isoformat") else str(body.time_end)
+    if time_filter:
+        filters["created_at"] = time_filter
 
     try:
-        result = await memory_store.search(
-                query=body.query,
-                user_id=body.user_id,
-                db=db,
-                agent_id=agent_id,
-                scene_id=body.scene_id,
-                task_id=body.task_id,
-                session_id=body.session_id,
-                memory_types=body.memory_types,
-                status=body.status,
-                max_content_length=body.max_content_length,
-                time_start=body.time_start,
-                time_end=body.time_end,
-                top_k=body.top_k,
-                rerank=body.rerank,
-            )
+        # ── 主路径: mem0 三路混合检索 + Qdrant 层过滤 ──
+        from app.services.mem0_client import mem0_client as _m0
+        import math as _math
+
+        raw = _m0.search(
+            query=body.query,
+            user_id=body.user_id,
+            limit=body.top_k,
+            filters=filters if filters else None,
+            rerank=body.rerank,
+        )
+
+        now_dt = datetime.now(timezone.utc)
+        HALF_LIFE_DAYS = 30        # 30天后新近性权重减半
+        RECENCY_WEIGHT = 0.15      # 综合分中新近性占比
+
+        results = []
+        for item in raw.get("results", []):
+            meta = item.get("metadata", {})
+            content = item.get("memory", "")
+            if body.max_content_length and len(content) > body.max_content_length:
+                content = content[:body.max_content_length]
+
+            mem_score = item.get("score", 0)
+
+            # 时间新近性: recency = 0.5 ^ (age_days / 30)
+            recency = 0.5
+            created_str = item.get("created_at", "")
+            if created_str:
+                try:
+                    created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                    if created_dt.tzinfo is not None:
+                        created_dt = created_dt.replace(tzinfo=None)
+                    age_seconds = max(0, (now_dt.replace(tzinfo=None) - created_dt).total_seconds())
+                    age_days = age_seconds / 86400
+                    recency = _math.pow(0.5, age_days / HALF_LIFE_DAYS)
+                except Exception:
+                    pass
+
+            # 融合: final = mem0分 × (1-w) + 新近性 × w
+            final_score = round(mem_score * (1 - RECENCY_WEIGHT) + recency * RECENCY_WEIGHT, 4)
+
+            results.append({
+                "id": item.get("id", ""),
+                "content": content,
+                "summary": meta.get("summary", content[:200]),
+                "memory_type": meta.get("memory_type", ""),
+                "scene_id": meta.get("scene_id", ""),
+                "task_id": meta.get("task_id", ""),
+                "session_id": meta.get("session_id", ""),
+                "status": meta.get("status", "active"),
+                "importance": meta.get("importance", 0.5),
+                "confidence": meta.get("confidence", 0.5),
+                "relevance_score": final_score,
+                "created_at": item.get("created_at", ""),
+                "updated_at": item.get("updated_at", ""),
+            })
+
+        # 按融合分重排
+        results.sort(key=lambda x: x["relevance_score"], reverse=True)
+        results = results[:body.top_k]
+
+        elapsed_ms = round((time_module.perf_counter() - t0) * 1000)
+        total_candidates = len(raw.get("results", []))
+        result = {
+            "query": body.query,
+            "results": results,
+            "total_candidates": total_candidates,
+            "elapsed_ms": elapsed_ms,
+            "elapsed_ms": elapsed_ms,
+        }
+
         logger.info(
-            f"Search: user={body.user_id}, query='{body.query[:50]}...', "
-            f"found={len(result['results'])}, elapsed={result['elapsed_ms']}ms"
+            f"Search(mem0): user={body.user_id}, query='{body.query[:50]}...', "
+            f"found={len(results)}, elapsed={elapsed_ms}ms"
         )
 
         # Fire-and-forget 检索日志
@@ -721,28 +738,34 @@ async def memory_search(
             filter_conditions={
                 "memory_types": body.memory_types,
                 "status": body.status,
-                "time_start": str(body.time_start) if body.time_start else None,
-                "time_end": str(body.time_end) if body.time_end else None,
+                "filters": filters,
             },
             top_k=body.top_k,
-            results=result.get("results", []),
-            elapsed_ms=result.get("elapsed_ms", 0),
+            results=results,
+            elapsed_ms=elapsed_ms,
             retrieval_mode="hybrid",
         ))
 
         return ok(result)
+
     except Exception as e:
-        logger.warning(f"MemoryStore search failed, falling back to legacy: {e}")
+        import traceback as _tb
+        logger.error(f"mem0 search FAILED: {type(e).__name__}: {e}\n{_tb.format_exc()}")
         try:
-            result = legacy_search(
+            # ── 降级: memory_store (PG 后过滤) ──
+            result = await memory_store.search(
                 query=body.query,
                 user_id=body.user_id,
+                db=db,
+                agent_id=agent_id,
                 scene_id=body.scene_id,
                 task_id=body.task_id,
                 session_id=body.session_id,
                 memory_types=body.memory_types,
                 status=body.status,
                 max_content_length=body.max_content_length,
+                time_start=body.time_start,
+                time_end=body.time_end,
                 top_k=body.top_k,
                 rerank=body.rerank,
             )

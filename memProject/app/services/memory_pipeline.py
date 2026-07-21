@@ -485,18 +485,28 @@ class MemoryPipeline:
                 })
                 await db.flush()
 
-                # 准备向量
+                # mem0 写入 (embedding + Qdrant 一步完成)
                 try:
-                    vec = await self.embedding.embed_single(dr.content)
-                    vectors_to_upsert.append(vec)
-                    vector_payloads.append({
-                        "user_id": user_id,
-                        "memory_id": memory_id,
-                        "memory_type": dr.memory_type,
-                    })
-                    vector_ids.append(memory_id)
+                    from app.services.mem0_client import mem0_client as _m0
+                    _m0.add(
+                        messages=[{"role": "user", "content": dr.content}],
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        metadata={
+                            "memory_id": memory_id,
+                            "scene_id": scene_id,
+                            "task_id": task_id,
+                            "session_id": session_id,
+                            "memory_type": dr.memory_type,
+                            "status": status,
+                            "importance": dr.importance,
+                            "confidence": dr.confidence,
+                        },
+                        infer=False,
+                    )
                 except Exception as e:
-                    logger.warning(f"Failed to embed memory {memory_id}: {e}")
+                    logger.warning(f"mem0 write failed for {memory_id}: {e}")
 
             elif dr.action in (DedupAction.MERGE, DedupAction.UPDATE_EXISTING):
                 # 更新已有记忆
@@ -542,18 +552,28 @@ class MemoryPipeline:
                             confidence=0.85,
                         ))
 
-                        # 准备更新向量
+                        # mem0 更新向量
                         try:
-                            vec = await self.embedding.embed_single(dr.content)
-                            vectors_to_upsert.append(vec)
-                            vector_payloads.append({
-                                "user_id": user_id,
-                                "memory_id": memory_id,
-                                "memory_type": dr.memory_type,
-                            })
-                            vector_ids.append(memory_id)
+                            from app.services.mem0_client import mem0_client as _m0
+                            _m0.add(
+                                messages=[{"role": "user", "content": dr.content}],
+                                user_id=user_id,
+                                agent_id=agent_id,
+                                session_id=session_id,
+                                metadata={
+                                    "memory_id": memory_id,
+                                    "scene_id": scene_id,
+                                    "task_id": task_id,
+                                    "session_id": session_id,
+                                    "memory_type": dr.memory_type,
+                                    "status": existing.status if existing else "active",
+                                    "importance": dr.importance,
+                                    "confidence": dr.confidence,
+                                },
+                                infer=False,
+                            )
                         except Exception as e:
-                            logger.warning(f"Failed to embed updated memory {memory_id}: {e}")
+                            logger.warning(f"mem0 update failed for {memory_id}: {e}")
                     else:
                         logger.warning(f"Memory {memory_id} not found for MERGE/UPDATE")
                 except Exception as e:
@@ -612,18 +632,28 @@ class MemoryPipeline:
                     except Exception as e:
                         logger.warning(f"Failed to update conflict target {conflict_id}: {e}")
 
-                # 准备向量
+                # mem0 写入冲突记忆
                 try:
-                    vec = await self.embedding.embed_single(dr.content)
-                    vectors_to_upsert.append(vec)
-                    vector_payloads.append({
-                        "user_id": user_id,
-                        "memory_id": memory_id,
-                        "memory_type": dr.memory_type,
-                    })
-                    vector_ids.append(memory_id)
+                    from app.services.mem0_client import mem0_client as _m0
+                    _m0.add(
+                        messages=[{"role": "user", "content": dr.content}],
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        metadata={
+                            "memory_id": memory_id,
+                            "scene_id": scene_id,
+                            "task_id": task_id,
+                            "session_id": session_id,
+                            "memory_type": dr.memory_type,
+                            "status": "conflict",
+                            "importance": dr.importance,
+                            "confidence": dr.confidence,
+                        },
+                        infer=False,
+                    )
                 except Exception as e:
-                    logger.warning(f"Failed to embed conflict memory {memory_id}: {e}")
+                    logger.warning(f"mem0 write failed for conflict {memory_id}: {e}")
 
         # 提交数据库
         try:
@@ -633,17 +663,6 @@ class MemoryPipeline:
             logger.error(f"DB commit failed: {e}")
             await db.rollback()
             raise MemoryGenerationError(f"记忆存储失败: {str(e)}")
-
-        # 写入 Qdrant
-        if vectors_to_upsert and self.qdrant.is_available:
-            try:
-                self.qdrant.upsert_vectors(
-                    vectors=vectors_to_upsert,
-                    payloads=vector_payloads,
-                    ids=vector_ids,
-                )
-            except Exception as e:
-                logger.warning(f"Qdrant upsert failed (non-fatal): {e}")
 
 
 # 模块级单例

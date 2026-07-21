@@ -31,3 +31,5 @@ tools/
 # Test artifacts
 *.db
 test_frontend.db
+continue_zh.jsonl
+continue_zh.jsonl
