@@ -310,6 +310,17 @@ async def memory_write(
         f"discarded={pipeline_result.discarded_count}, elapsed={elapsed}ms"
     )
 
+    # 异步双写到 mem0（fire-and-forget，失败不阻塞响应）
+    background_tasks.add_task(
+        _sync_pipeline_to_mem0,
+        pipeline_result=pipeline_result,
+        user_id=effective_user_id,
+        agent_id=agent_id,
+        scene_id=effective_scene_id,
+        session_id=effective_session_id,
+        task_id=effective_task_id,
+    )
+
     return ok(MemoryWriteResponse(results=results, mode="pipeline").model_dump())
 
 
@@ -409,6 +420,60 @@ async def _batch_write_records(
 
     if records:
         await db.execute(insert(InteractionRecord), records)
+
+
+# ============================================================
+# mem0 异步双写
+# ============================================================
+
+def _sync_pipeline_to_mem0(
+    pipeline_result,
+    user_id: str,
+    agent_id: str,
+    scene_id: str | None,
+    session_id: str | None,
+    task_id: str | None,
+) -> None:
+    """
+    Pipeline 写入完成后，异步同步每条记忆到 mem0。
+    所有 ID 字段和结构化元数据传入 metadata。
+    失败仅打 warning，绝不影响主链路。
+    """
+    from app.services.mem0_client import mem0_client as _mem0
+    if not _mem0.is_available:
+        logger.debug("mem0 未初始化，跳过 mem0 双写")
+        return
+
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    for detail in pipeline_result.details:
+        action = detail.get("action", "")
+        if action in ("discard",):
+            continue
+
+        metadata = {
+            "scene_id": scene_id,
+            "task_id": task_id,
+            "memory_type": detail.get("memory_type", "fact"),
+            "importance": detail.get("importance", 0.5),
+            "confidence": detail.get("confidence", 0.5),
+            "created_at": created_at,
+        }
+
+        content = detail.get("content_preview", "")
+        memory_id = detail.get("memory_id") or ""
+
+        try:
+            _mem0.add(
+                messages=[{"role": "user", "content": content}],
+                user_id=user_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                metadata=metadata,
+            )
+            logger.debug(f"mem0 sync OK: memory_id={memory_id}")
+        except Exception as e:
+            logger.warning(f"mem0 sync failed (non-fatal): memory_id={memory_id}, err={e}")
 
 
 # ============================================================
