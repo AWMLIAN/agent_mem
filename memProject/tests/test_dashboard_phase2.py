@@ -9,9 +9,12 @@ Dashboard Phase 2 专项测试 — generation_summary 与 retrieval_signal_distr
   P04: 检索信号比例之和 ≈ 1.0（有数据时）
   P05: generation_summary 各字段类型正确
   P06: 无数据时返回默认零值而非缺失字段
+  P13: 删除/恢复记忆后 deleted_at 与 Dashboard 计数闭环
 """
 import httpx
 import pytest
+import time
+from datetime import datetime, timezone
 
 BASE = "http://localhost:8000/api/v1/admin"
 MEM_BASE = "http://localhost:8000/api/v1/memory"
@@ -164,37 +167,70 @@ def test_P12_dashboard_consistency_with_stats():
     assert dash_mem == stats_mem, f"memory_count 不一致: {msg}"
 
 
-def test_P13_delete_deleted_at_written():
-    """P13: delete verifies deleted_at is written"""
-    import time, subprocess
-    uid = f"test_dash_p13_{int(time.time())}"
-    r = httpx.post("http://localhost:8000/api/v1/memory/write",
-        json={"user_id": uid, "messages": [{"role": "user", "content": "I like sports and reading every day."}]},
-        timeout=30)
-    results = r.json().get("data", {}).get("results", [])
-    if not results:
-        pytest.skip("LLM did not generate memory")
-    mem_id = results[0].get("id")
-    if not mem_id:
-        pytest.skip("no memory_id")
-    time.sleep(3)
-    r = httpx.request("DELETE", "http://localhost:8000/api/v1/memory/delete",
-        json={"memory_id": mem_id}, timeout=30)
-    assert r.status_code == 200
-    body = r.json()
-    assert body.get("data", {}).get("deleted") == True
-    check = subprocess.run(
-        ["docker", "exec", "-e", "PGPASSWORD=mempassword", "memproject-postgres-1",
-         "psql", "-U", "memuser", "-h", "localhost", "-d", "agent_memory", "-t", "-A",
-         "-c", f"SELECT status, deleted_at FROM t_memory WHERE memory_id='{mem_id}'"],
-        capture_output=True, text=True, timeout=15)
-    out = check.stdout.strip()
-    parts = out.split("|")
-    assert "deleted" in parts[0].lower() if parts else False, f"status not deleted: {out}"
-    assert len(parts) > 1 and parts[1].strip() and "NULL" not in parts[1], f"deleted_at is NULL: {out}"
-    nl = chr(10)
-    cleanup = f"DELETE FROM t_memory WHERE user_id='{uid}';{nl}DELETE FROM t_interaction_record WHERE user_id='{uid}';{nl}"
-    subprocess.run(
-        ["docker", "exec", "-i", "memproject-postgres-1", "psql", "-U", "memuser", "-d", "agent_memory"],
-        input=cleanup.encode(),
-        capture_output=True, timeout=15)
+@pytest.mark.asyncio
+async def test_P13_delete_deleted_at_written(p13_test_memory):
+    """
+    P13: 删除记忆 → deleted_at 写入 → Dashboard 计数同步。
+    不依赖 LLM，通过 fixture 预建确定性记忆。
+    使用同步 SQLAlchemy 验证 deleted_at（无 docker exec）。
+    """
+    from sqlalchemy import create_engine, text
+    from app.core.config import get_settings
+
+    s = get_settings()
+    sync_url = f"postgresql://{s.database.user}:{s.database.password}@{s.database.host}:{s.database.port}/{s.database.database}"
+    uid, mem_id, headers = p13_test_memory
+    ADMIN = "http://localhost:8000/api/v1/admin"
+    MEM = "http://localhost:8000/api/v1/memory"
+
+    async with httpx.AsyncClient(timeout=30) as cli:
+        # 1. 删除前取证：用户维度的记忆数
+        list_before = await cli.post(f"{MEM}/list?user_id={uid}&page=1&page_size=10", headers=headers)
+        count_before = list_before.json()["data"]["total"]
+        assert count_before >= 1, f"预建记忆应 >=1，实际 {count_before}"
+
+        # 2. 删除记忆
+        del_resp = await cli.request("DELETE", f"{MEM}/delete",
+            json={"memory_id": mem_id}, headers=headers)
+        assert del_resp.status_code == 200
+        assert del_resp.json()["code"] == 0
+        assert del_resp.json()["data"]["deleted"] is True
+
+        # 3. 验证 deleted_at 已写入（同步 SQLAlchemy，无 docker exec）
+        check_engine = create_engine(sync_url)
+        with check_engine.connect() as c:
+            row = c.execute(text("SELECT status, deleted_at FROM t_memory WHERE memory_id=:mid"),
+                           {"mid": mem_id}).fetchone()
+        assert row is not None
+        assert row[0] == "deleted", f"状态应为 deleted，实际 {row[0]}"
+        assert row[1] is not None, "deleted_at 不应为 NULL"
+
+        # 4. 用户维度的列表计数减少
+        list_after_del = await cli.post(f"{MEM}/list?user_id={uid}&page=1&page_size=10", headers=headers)
+        count_after_del = list_after_del.json()["data"]["total"]
+        assert count_after_del == count_before - 1, (
+            f"删除后用户记忆计数应减 1: {count_before} -> {count_after_del}"
+        )
+
+        # 5. 恢复记忆（active，清除 deleted_at）
+        upd_resp = await cli.put(f"{MEM}/update",
+            json={"memory_id": mem_id, "status": "active"}, headers=headers)
+        assert upd_resp.status_code == 200
+        assert upd_resp.json()["data"]["updated"] is True
+
+        # 6. 验证 deleted_at 已清除
+        with check_engine.connect() as c:
+            row2 = c.execute(text("SELECT status, deleted_at FROM t_memory WHERE memory_id=:mid"),
+                            {"mid": mem_id}).fetchone()
+        assert row2 is not None
+        assert row2[0] == "active", f"恢复后状态应为 active，实际 {row2[0]}"
+        assert row2[1] is None, "恢复后 deleted_at 应为 NULL"
+
+        # 7. 用户维度的记忆数恢复
+        list_final = await cli.post(f"{MEM}/list?user_id={uid}&page=1&page_size=10", headers=headers)
+        count_final = list_final.json()["data"]["total"]
+        assert count_final == count_before, (
+            f"恢复后计数应回到原值: {count_before} -> {count_final}"
+        )
+
+        check_engine.dispose()
