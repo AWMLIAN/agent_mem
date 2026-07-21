@@ -190,7 +190,6 @@ class Memory(Base):
     source_type = Column(String(32), default="extracted")
     source_record_ids = Column(JSON, default=list)
 
-    memory_scope = Column(String(16), nullable=True, index=True)
     vector_id = Column(String(64), nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), default=_now)

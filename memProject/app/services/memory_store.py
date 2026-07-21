@@ -799,14 +799,18 @@ class MemoryStore:
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
 
+        # 统一清理条件：记忆已删除且 (deleted_at ?? updated_at) 超过 cutoff
+        from sqlalchemy import func as sa_func
+
+        age_expr = sa_func.coalesce(Memory.deleted_at, Memory.updated_at)
+
         # 统计待清理
         count_stmt = (
-            select(func.count())
+            select(sa_func.count())
             .select_from(Memory)
             .where(
                 Memory.status == "deleted",
-                (Memory.deleted_at.isnot(None)) & (Memory.deleted_at < cutoff)
-                | (Memory.deleted_at.is_(None)) & (Memory.updated_at < cutoff),
+                age_expr < cutoff,
             )
         )
         total = (await db.execute(count_stmt)).scalar() or 0
@@ -814,13 +818,15 @@ class MemoryStore:
         if dry_run or total == 0:
             return {"deleted": 0, "total_candidates": total, "dry_run": dry_run}
 
+        # 删除前收集 memory_id（删除后记录消失，无法再查）
+        ids_stmt = select(Memory.memory_id).where(
+            Memory.status == "deleted", age_expr < cutoff,
+        )
+        purge_ids = (await db.execute(ids_stmt)).scalars().all()
+
         # 物理删除
-        delete_stmt = (
-            delete(Memory)
-            .where(
-                Memory.status == "deleted",
-                Memory.updated_at < cutoff,
-            )
+        delete_stmt = delete(Memory).where(
+            Memory.status == "deleted", age_expr < cutoff,
         )
         result = await db.execute(delete_stmt)
         await db.commit()
@@ -828,18 +834,9 @@ class MemoryStore:
         deleted_count = result.rowcount
 
         # 同步清理 Qdrant（尽力而为）
-        if self.qdrant.is_available and deleted_count > 0:
+        if self.qdrant.is_available and deleted_count > 0 and purge_ids:
             try:
-                ids_stmt = (
-                    select(Memory.memory_id)
-                    .where(
-                        Memory.status == "deleted",
-                        Memory.updated_at < cutoff,
-                    )
-                )
-                remaining = (await db.execute(ids_stmt)).scalars().all()
-                if remaining:
-                    self.qdrant.delete_vectors(list(remaining))
+                self.qdrant.delete_vectors(purge_ids)
             except Exception as e:
                 logger.warning(f"Qdrant purge failed (non-fatal): {e}")
 
