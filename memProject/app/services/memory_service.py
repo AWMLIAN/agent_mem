@@ -670,8 +670,20 @@ def _infer_scope(data: dict) -> str:
     return "user"
 
 
+_stats_cache: dict[str, tuple[float, dict]] = {}  # key → (timestamp, result)
+_STATS_CACHE_TTL = 10  # 秒
+
+
 async def get_memory_stats(db: AsyncSession, user_id: str, scene_id: str | None = None) -> dict:
-    """层级统计：按 memory_scope 列 + user/session/task/agent 四级聚合。"""
+    """层级统计：按 memory_scope 列 + user/session/task/agent 四级聚合（10秒缓存）。"""
+    import time as _time
+
+    cache_key = f"stats:{user_id}:{scene_id or ''}"
+    if cache_key in _stats_cache:
+        ts, cached = _stats_cache[cache_key]
+        if _time.time() - ts < _STATS_CACHE_TTL:
+            return cached
+
     query = (
         select(
             func.coalesce(Memory.memory_scope, "user").label("scope"),
@@ -690,7 +702,7 @@ async def get_memory_stats(db: AsyncSession, user_id: str, scene_id: str | None 
     counts = {lv: rows.get(lv, 0) for lv in levels}
     total = sum(counts.values())
 
-    return {
+    data = {
         "total": total,
         "level_distribution": [
             {"level": lv, "count": counts[lv],
@@ -698,6 +710,9 @@ async def get_memory_stats(db: AsyncSession, user_id: str, scene_id: str | None 
             for lv in levels
         ],
     }
+
+    _stats_cache[cache_key] = (_time.time(), data)
+    return data
 
 
 async def get_memory_relations(db: AsyncSession, memory_id: str) -> list[dict]:

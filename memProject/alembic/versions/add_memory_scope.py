@@ -37,6 +37,9 @@ def upgrade() -> None:
         WHERE memory_scope IS NULL
     """)
 
+    # 回填后设 NOT NULL
+    op.alter_column('t_memory', 'memory_scope', nullable=False)
+
 
 def downgrade() -> None:
     op.drop_constraint('ck_memory_scope', 't_memory', type_='check')
