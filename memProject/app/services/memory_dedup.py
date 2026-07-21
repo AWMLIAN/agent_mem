@@ -250,6 +250,9 @@ class DedupService:
         for existing in existing_memories:
             vector_score = hit_score_map.get(existing.memory_id, 0.0)
             keyword_overlap = self._compute_keyword_overlap(candidate, existing)
+            # 安全网：向量明确相似但分词失败 → 设置底线，不让关键词分拖垮 composite
+            if vector_score > 0.85 and keyword_overlap < 0.15:
+                keyword_overlap = 0.15
             identity_match = self._check_identity(
                 candidate, existing, task_id, session_id
             )
@@ -419,18 +422,34 @@ class DedupService:
 
     @staticmethod
     def _extract_nouns(text: str) -> list[str]:
-        """简单关键词提取：中英文词语（2+ 字符）。"""
-        english = re.findall(r"[a-zA-Z]{3,}", text)
-        chinese = re.findall(r"[一-鿿]{2,4}", text)
-        keywords = english + chinese
-        seen = set()
-        unique = []
+        """中英文关键词提取：中文 bigram/trigram + 英文技术术语。
+
+        中文使用字符 bigram + trigram 而非滑动窗口切词，
+        避免相同语义不同表述产生完全不重叠的关键词集合。
+        """
+        # 英文：包含连字符、数字、下划线的技术术语（如 kube-version, semver, api_v2）
+        english = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_-]{2,}", text)
+
+        # 中文：字符 bigram + trigram（覆盖 2-3 字词，比原滑动窗口鲁棒得多）
+        chinese_chars = re.findall(r"[一-鿿]", text)
+        bigrams = {
+            chinese_chars[i] + chinese_chars[i + 1]
+            for i in range(len(chinese_chars) - 1)
+        }
+        trigrams = {
+            chinese_chars[i] + chinese_chars[i + 1] + chinese_chars[i + 2]
+            for i in range(len(chinese_chars) - 2)
+        }
+
+        keywords = english + list(bigrams | trigrams)
+        seen: set[str] = set()
+        unique: list[str] = []
         for kw in keywords:
             low = kw.lower()
             if low not in seen:
                 seen.add(low)
                 unique.append(low)
-        return unique[:20]
+        return unique[:30]
 
     # ---------- 标识校验（v2 增强：含 session_id）----------
 
@@ -537,8 +556,8 @@ class DedupService:
           composite >= 0.90 + identity     → DISCARD (近乎重复)
           composite >= 0.78 + identity     → UPDATE_EXISTING (明确更新)
           composite >= 0.80 + conflict     → CONFLICT (潜在冲突)
-          composite >= 0.55 + !identity    → MERGE (相似但不同主体)
-          composite < 0.55                 → KEEP_NEW
+          composite >= 0.50 + !identity    → MERGE (相似但不同主体)
+          composite < 0.50                 → KEEP_NEW
 
         新增 CONFLICT 路径：高相似度 + 存在冲突信号 → CONFLICT
         """
@@ -577,7 +596,7 @@ class DedupService:
             return DedupAction.DISCARD
         elif composite >= 0.78 and identity_match:
             return DedupAction.UPDATE_EXISTING
-        elif composite >= 0.55:
+        elif composite >= 0.50:
             return DedupAction.MERGE
         else:
             return DedupAction.KEEP_NEW
