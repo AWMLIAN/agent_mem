@@ -31,8 +31,8 @@ mem0:
     provider: "qdrant"
     config:
       host: "${QDRANT_HOST:-localhost}"
-      port: 6334
-      grpc_port: 6334
+      port: 6333
+      grpc_port: 6333
       embedding_model_dims: 1024
       collection_name: "openmemory"
   history_store:

@@ -32,12 +32,15 @@ import time as time_module
 from typing import Optional
 from uuid import uuid4
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
     DEFAULT_DEV_SCENE_ID,
+    authorize_user_access,
     get_current_agent,
     get_current_user_id,
     get_current_scene_id,
@@ -98,6 +101,7 @@ async def _log_retrieval(
     top_k: int,
     results: list[dict],
     elapsed_ms: int,
+    retrieval_mode: str = "hybrid",
 ):
     """异步写检索日志，失败不阻塞主流程。"""
     try:
@@ -112,6 +116,7 @@ async def _log_retrieval(
                 query_text=query_text,
                 filter_conditions=filter_conditions,
                 top_k=top_k,
+                retrieval_mode=retrieval_mode,
             ))
             await log_db.flush()
 
@@ -307,6 +312,17 @@ async def memory_write(
         f"discarded={pipeline_result.discarded_count}, elapsed={elapsed}ms"
     )
 
+    # 异步双写到 mem0（fire-and-forget，失败不阻塞响应）
+    background_tasks.add_task(
+        _sync_pipeline_to_mem0,
+        pipeline_result=pipeline_result,
+        user_id=effective_user_id,
+        agent_id=agent_id,
+        scene_id=effective_scene_id,
+        session_id=effective_session_id,
+        task_id=effective_task_id,
+    )
+
     return ok(MemoryWriteResponse(results=results, mode="pipeline").model_dump())
 
 
@@ -409,6 +425,60 @@ async def _batch_write_records(
 
 
 # ============================================================
+# mem0 异步双写
+# ============================================================
+
+def _sync_pipeline_to_mem0(
+    pipeline_result,
+    user_id: str,
+    agent_id: str,
+    scene_id: str | None,
+    session_id: str | None,
+    task_id: str | None,
+) -> None:
+    """
+    Pipeline 写入完成后，异步同步每条记忆到 mem0。
+    所有 ID 字段和结构化元数据传入 metadata。
+    失败仅打 warning，绝不影响主链路。
+    """
+    from app.services.mem0_client import mem0_client as _mem0
+    if not _mem0.is_available:
+        logger.debug("mem0 未初始化，跳过 mem0 双写")
+        return
+
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    for detail in pipeline_result.details:
+        action = detail.get("action", "")
+        if action in ("discard",):
+            continue
+
+        metadata = {
+            "scene_id": scene_id,
+            "task_id": task_id,
+            "memory_type": detail.get("memory_type", "fact"),
+            "importance": detail.get("importance", 0.5),
+            "confidence": detail.get("confidence", 0.5),
+            "created_at": created_at,
+        }
+
+        content = detail.get("content_preview", "")
+        memory_id = detail.get("memory_id") or ""
+
+        try:
+            _mem0.add(
+                messages=[{"role": "user", "content": content}],
+                user_id=user_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                metadata=metadata,
+            )
+            logger.debug(f"mem0 sync OK: memory_id={memory_id}")
+        except Exception as e:
+            logger.warning(f"mem0 sync failed (non-fatal): memory_id={memory_id}, err={e}")
+
+
+# ============================================================
 # Pipeline 结果映射
 # ============================================================
 
@@ -419,7 +489,7 @@ def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
     映射规则:
       keep_new        → ADD      (新记忆创建)
       merge           → MERGE    (合并到已有)
-      update_existing → ADD      (更新视为新增信息)
+      update_existing → UPDATE   (更新已有记忆)
       discard         → SKIP     (重复或不包含新信息)
       conflict        → CONFLICT (冲突需人工确认)
     """
@@ -448,7 +518,13 @@ def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
                 memory=f"[冲突] {content}",
                 event=MemoryEvent.ADD,  # 仍写入但标记为 pending
             ))
-        else:  # keep_new / update_existing
+        elif action == "update_existing":
+            results.append(WriteResultItem(
+                id=memory_id,
+                memory=content,
+                event=MemoryEvent.UPDATE,
+            ))
+        else:  # keep_new
             results.append(WriteResultItem(
                 id=memory_id,
                 memory=content,
@@ -651,6 +727,7 @@ async def memory_search(
             top_k=body.top_k,
             results=result.get("results", []),
             elapsed_ms=result.get("elapsed_ms", 0),
+            retrieval_mode="hybrid",
         ))
 
         return ok(result)
@@ -949,3 +1026,94 @@ async def memory_delete_all(
         "message": store_result["message"],
         "deleted_count": store_result["deleted_count"],
     })
+
+
+# ============================================================
+# 记忆层级分布统计 — 对齐记忆层级统计接口交接文档
+# ============================================================
+
+SCOPE_LEVELS = ("user", "session", "task", "agent")
+CLASSIFICATION_VERSION = "memory_scope_v1"
+
+
+@router.get("/stats", summary="记忆层级分布统计")
+async def memory_stats(
+    request: Request,
+    user_id: str = Query(..., min_length=1, description="用户标识"),
+    scene_id: str | None = Query(None, description="场景过滤条件（可选）"),
+    db: AsyncSession = Depends(get_db),
+    agent_id: str = Depends(get_current_agent),
+):
+    """
+    统计指定用户在各记忆层级（user/session/task/agent）的分布。
+
+    返回 total、level_distribution（四项固定）、generated_at、classification_version。
+    统计条件与 /memory/list 保持一致，确保 stats.total == list.total。
+    默认只统计 status=active 的记录（与列表口径一致）。
+    """
+    start = time_module.perf_counter()
+    trace_id = f"trace_{uuid4().hex[:24]}"
+
+    try:
+        # 授权校验：agent 已在 get_current_agent 中通过 X-API-Key 认证
+        # 数据隔离由 agent 绑定的 scene_id 保障
+        await authorize_user_access(
+            requested_user_id=user_id,
+            agent_id=agent_id,
+            request=request,
+        )
+
+        # 聚合查询：单次 GROUP BY 完成，不循环查四次
+        # status="active" 与 /memory/list 默认口径一致，确保 stats.total == list.total
+        counts = await memory_store.count_by_scope(
+            user_id=user_id,
+            db=db,
+            scene_id=scene_id,
+            status="active",
+        )
+
+        # 补齐四项并计算 total / ratio
+        total = sum(counts.get(level, 0) for level in SCOPE_LEVELS)
+        distribution = [
+            {
+                "level": level,
+                "count": counts.get(level, 0),
+                "ratio": round(counts.get(level, 0) / total, 4) if total else 0,
+            }
+            for level in SCOPE_LEVELS
+        ]
+
+        elapsed_ms = int((time_module.perf_counter() - start) * 1000)
+
+        logger.info(
+            f"Stats: user={user_id}, scene={scene_id or '(none)'}, "
+            f"total={total}, elapsed={elapsed_ms}ms, trace_id={trace_id}"
+        )
+
+        return ok({
+            "total": total,
+            "level_distribution": distribution,
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "classification_version": CLASSIFICATION_VERSION,
+        })
+
+    except Exception as e:
+        elapsed_ms = int((time_module.perf_counter() - start) * 1000)
+        logger.error(
+            f"Stats query failed: user={user_id}, scene={scene_id or '(none)'}, "
+            f"elapsed={elapsed_ms}ms, trace_id={trace_id}, error={e}"
+        )
+        return error(
+            message="统计查询异常",
+            code=-1,
+            data={
+                "total": 0,
+                "level_distribution": [
+                    {"level": level, "count": 0, "ratio": 0}
+                    for level in SCOPE_LEVELS
+                ],
+                "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "classification_version": CLASSIFICATION_VERSION,
+            },
+            error_code="STATS_FAILED",
+        )

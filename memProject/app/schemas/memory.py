@@ -138,6 +138,7 @@ class MemoryWriteRequest(BaseModel):
 class MemoryEvent(str, Enum):
     """记忆事件类型"""
     ADD = "ADD"       # 新增记忆
+    UPDATE = "UPDATE" # 更新已有记忆
     SKIP = "SKIP"     # 跳过（无价值信息）
     MERGE = "MERGE"   # 合并到已有记忆
 
@@ -146,11 +147,12 @@ class WriteResultItem(BaseModel):
     """单条写入结果（对齐前端文档 results 数组元素）"""
     id: str = Field(..., description="记忆 ID")
     memory: str = Field(..., description="记忆内容摘要")
-    event: MemoryEvent = Field(..., description="事件: ADD / SKIP / MERGE")
+    event: MemoryEvent = Field(..., description="事件: ADD / UPDATE / SKIP / MERGE")
 
 
 class MemoryWriteResponse(BaseModel):
     """写入响应"""
+    mode: str = Field(default="legacy", description="处理路径：pipeline|mock|mq|mq_timeout|degraded")
     results: list[WriteResultItem] = Field(default_factory=list, description="每条消息的处理结果")
 
 
@@ -206,6 +208,8 @@ class MemorySearchRequest(BaseModel):
     time_end: Optional[datetime] = Field(None)
     include_scores: bool = Field(default=True)
     rerank: bool = Field(default=True, description="启用 Reranker 二次排序（+150-200ms，默认开启）")
+    status: Optional[list[str]] = Field(None, description="筛选状态，不传默认只查 active")
+    max_content_length: Optional[int] = Field(None, description="返回内容最大字符数，超出截断")
 
 
 # ============================================================
