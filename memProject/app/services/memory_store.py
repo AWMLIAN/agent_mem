@@ -763,8 +763,6 @@ class MemoryStore:
         previous_status = memory.status
         memory.status = "deleted"
         memory.deleted_at = datetime.now(timezone.utc)
-        memory.extra_meta = memory.extra_meta or {}
-        memory.extra_meta["delete_reason"] = reason or "用户要求"
         memory.updated_at = datetime.now(timezone.utc)
 
         await db.commit()
