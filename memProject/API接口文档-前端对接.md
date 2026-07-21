@@ -326,7 +326,7 @@ messages 数组 → 拼接对话文本 → MemoryPipeline
 |-----------------|-----------|------|
 | `keep_new` | `ADD` | 新记忆已创建 |
 | `merge` | `MERGE` | 合并到已有记忆 |
-| `update_existing` | `ADD` | 更新已有记忆（视为新增信息） |
+| `update_existing` | `UPDATE` | 更新已有记忆（内容变化但同一记忆） |
 | `discard` | `SKIP` | 高度重复，跳过 |
 
 ### 延迟预估

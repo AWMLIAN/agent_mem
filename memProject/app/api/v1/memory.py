@@ -424,7 +424,7 @@ def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
     映射规则:
       keep_new        → ADD      (新记忆创建)
       merge           → MERGE    (合并到已有)
-      update_existing → ADD      (更新视为新增信息)
+      update_existing → UPDATE   (更新已有记忆)
       discard         → SKIP     (重复或不包含新信息)
       conflict        → CONFLICT (冲突需人工确认)
     """
@@ -453,7 +453,13 @@ def _pipeline_to_write_results(pipeline_result) -> list[WriteResultItem]:
                 memory=f"[冲突] {content}",
                 event=MemoryEvent.ADD,  # 仍写入但标记为 pending
             ))
-        else:  # keep_new / update_existing
+        elif action == "update_existing":
+            results.append(WriteResultItem(
+                id=memory_id,
+                memory=content,
+                event=MemoryEvent.UPDATE,
+            ))
+        else:  # keep_new
             results.append(WriteResultItem(
                 id=memory_id,
                 memory=content,
@@ -692,6 +698,27 @@ async def memory_search(
 
 
 # ============================================================
+# 层级统计 — 通用记忆建模与多层记忆管理
+# ============================================================
+
+@router.get("/stats", summary="层级记忆统计")
+async def memory_stats(
+    user_id: str = Query(...),
+    scene_id: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    _agent: str = Depends(get_current_agent),
+):
+    """按 user/session/task/agent 四级统计。利用现有字段推断，不需要新增列。"""
+    from app.services.memory_service import get_memory_stats as _stats
+    from datetime import datetime as _dt, timezone as _tz
+
+    result = await _stats(db, user_id=user_id, scene_id=scene_id)
+    result["generated_at"] = _dt.now(_tz.utc).isoformat()
+    result["classification_version"] = "memory_scope_v1"
+    return ok(result)
+
+
+# ============================================================
 # 上下文 — 对齐前端对接文档 二.1 节
 # ============================================================
 
@@ -717,8 +744,12 @@ async def memory_context(
                 "goal": task_view["current_goal"]["content"] if task_view.get("current_goal") else "",
                 "timeline": [
                     {"stage": item.get("sub_type", "progress"), "content": item["content"]}
-                    for item in task_view.get("progress_timeline", [])
+                    for item in task_view.get("timeline", [])
                 ],
+                "constraints": [item["content"] for item in task_view.get("constraints", [])],
+                "processes": [item["content"] for item in task_view.get("processes", [])],
+                "decisions": [item["content"] for item in task_view.get("decisions", [])],
+                "facts": [item["content"] for item in task_view.get("facts", [])],
             }
 
         elif body.session_id:
@@ -857,6 +888,8 @@ async def memory_list(
     user_id: str = Query(...),
     scene_id: str | None = Query(None),
     task_id: str | None = Query(None),
+    session_id: str | None = Query(None),
+    memory_scope: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -873,6 +906,8 @@ async def memory_list(
             db=db,
             scene_id=scene_id,
             task_id=task_id,
+            session_id=session_id,
+            memory_scope=memory_scope,
             page=page,
             page_size=page_size,
         )
