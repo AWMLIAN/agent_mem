@@ -610,7 +610,7 @@ async def _compute_recent_tasks(
             .order_by(Task.updated_at.desc(), Task.task_id.asc())
             .limit(5)
         )
-    ).all()
+    ).scalars().all()
 
     return [
         RecentTaskItem(
