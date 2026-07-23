@@ -889,7 +889,8 @@ async def memory_context(
         if contents:
             try:
                 from app.services.llm_client import llm_client as _llm
-                lines = "\n".join(f"- {c[:200]}" for c in contents[:20])
+                memory_count = min(len(contents), 20)  # 实际送入 LLM 的条目数
+                lines = "\n".join(f"- {c[:200]}" for c in contents[:memory_count])
                 formatted_text = await _llm.chat_completion([{
                     "role": "user",
                     "content": f"将以下记忆碎片总结为一段通顺的摘要，注入AI对话上下文。保留关键信息，去除冗余：\n{lines}"
@@ -898,24 +899,26 @@ async def memory_context(
                 pass
 
         # 设置 context_snapshot 供日志中间件合并到 ApiLog
-        generated_at = datetime.now(timezone.utc)
-        trace_id = getattr(request.state, "trace_id", None)
-        request.state.context_snapshot = {
-            "version": 1,
-            "query": body.query,
-            "formatted_text": formatted_text,
-            "memory_count": len(contents),
-            "memory_ids": [],  # TODO: 从聚合来源记录原始 memory_id，当前仅追踪数量
-            "return_mode": "aggregation",
-            "scope_type": scope_type,
-            "user_id": body.user_id,
-            "agent_id": agent_id,
-            "scene_id": body.scene_id,
-            "session_id": body.session_id,
-            "task_id": body.task_id,
-            "generated_at": generated_at.isoformat(),
-            "trace_id": trace_id,
-        }
+        # 仅 formatted_text 非空时才写入，避免空快照污染 latest_context
+        if formatted_text:
+            generated_at = datetime.now(timezone.utc)
+            trace_id = getattr(request.state, "trace_id", None)
+            request.state.context_snapshot = {
+                "version": 1,
+                "query": body.query,
+                "formatted_text": formatted_text,
+                "memory_count": memory_count,
+                "memory_ids": [],  # TODO: 从聚合来源记录原始 memory_id，当前仅追踪数量
+                "return_mode": "aggregation",
+                "scope_type": scope_type,
+                "user_id": body.user_id,
+                "agent_id": agent_id,
+                "scene_id": body.scene_id,
+                "session_id": body.session_id,
+                "task_id": body.task_id,
+                "generated_at": generated_at.isoformat(),
+                "trace_id": trace_id,
+            }
 
         return ok({
             "aggregation": aggregation,
