@@ -683,54 +683,66 @@ async def _compute_latest_context(
     从 ApiLog 中查找最近一条成功 /api/v1/memory/context 记录，
     其 request_params 中必须包含 context_snapshot.version == 1。
     """
-    row = (
+    # 取最近 20 条成功 /context 记录，在 Python 中寻找第一条有效快照。
+    # 不把 JSON 过滤推到 SQL 层（避免 .astext 兼容问题），同时处理
+    # "最新日志无快照、更早日志有快照" 的场景。
+    rows = (
         await db.execute(
             select(ApiLog)
             .where(
                 ApiLog.api_path == "/api/v1/memory/context",
                 ApiLog.response_code >= 200,
                 ApiLog.response_code < 300,
-                ApiLog.request_params["context_snapshot"]["version"].astext == "1",
+                ApiLog.request_params.isnot(None),
                 ApiLog.created_at < as_of,
             )
             .order_by(ApiLog.created_at.desc(), ApiLog.log_id.desc())
-            .limit(1)
+            .limit(20)
         )
-    ).scalar_one_or_none()
+    ).scalars().all()
 
-    if row is None or row.request_params is None:
-        return None
+    for row in rows:
+        params = row.request_params
+        if not isinstance(params, dict):
+            continue
 
-    snap = row.request_params.get("context_snapshot")
-    if not isinstance(snap, dict):
-        return None
-    if snap.get("version") != 1:
-        return None
-    if not isinstance(snap.get("formatted_text"), str):
-        return None
-    if not snap.get("generated_at"):
-        return None
+        snap = params.get("context_snapshot")
+        if not isinstance(snap, dict):
+            continue
 
-    generated_at = None
-    try:
-        generated_at = datetime.fromisoformat(snap["generated_at"])
-    except (ValueError, TypeError):
-        return None  # generated_at 不可解析时视同无效快照
+        if snap.get("version") not in (1, "1"):
+            continue
 
-    return LatestContext(
-        formatted_text=snap["formatted_text"],
-        memory_count=snap.get("memory_count", 0),
-        query=snap.get("query"),
-        return_mode=snap.get("return_mode"),
-        scope_type=snap.get("scope_type"),
-        user_id=snap.get("user_id"),
-        agent_id=snap.get("agent_id"),
-        scene_id=snap.get("scene_id"),
-        session_id=snap.get("session_id"),
-        task_id=snap.get("task_id"),
-        generated_at=generated_at,
-        trace_id=snap.get("trace_id") or row.trace_id,
-    )
+        formatted_text = snap.get("formatted_text")
+        if not isinstance(formatted_text, str) or not formatted_text.strip():
+            continue
+
+        generated_at_raw = snap.get("generated_at")
+        if not generated_at_raw:
+            continue
+
+        generated_at = None
+        try:
+            generated_at = datetime.fromisoformat(str(generated_at_raw))
+        except (ValueError, TypeError):
+            generated_at = row.created_at
+
+        return LatestContext(
+            formatted_text=formatted_text,
+            memory_count=int(snap.get("memory_count") or 0),
+            query=snap.get("query"),
+            return_mode=snap.get("return_mode"),
+            scope_type=snap.get("scope_type"),
+            user_id=snap.get("user_id"),
+            agent_id=snap.get("agent_id"),
+            scene_id=snap.get("scene_id"),
+            session_id=snap.get("session_id"),
+            task_id=snap.get("task_id"),
+            generated_at=generated_at,
+            trace_id=snap.get("trace_id") or row.trace_id,
+        )
+
+    return None
 
 
 # ── Recent Tasks ────────────────────────────────────────────

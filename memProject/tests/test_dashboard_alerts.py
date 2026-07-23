@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app.schemas.dashboard import RecentAlertItem
-from app.services.dashboard_service import _compute_recent_alerts
+from app.services.dashboard_service import _compute_latest_context, _compute_recent_alerts
 
 
 def _make_row(**kwargs):
@@ -294,3 +294,213 @@ class _FixedDatetime:
     timezone = timezone
     timedelta = timedelta
     datetime = datetime
+
+
+# ============================================================
+# _compute_latest_context 单元测试
+# ============================================================
+
+def _make_api_log(request_params: dict | None, **kwargs) -> Mock:
+    """构造 ApiLog ORM 行 mock（用于 scalars().all()）。"""
+    row = Mock(spec=["request_params", "trace_id", "created_at"])
+    row.request_params = request_params
+    row.trace_id = kwargs.pop("trace_id", "trace_default")
+    row.created_at = kwargs.pop("created_at", datetime(2026, 7, 23, 12, 0, 0, tzinfo=timezone.utc))
+    for k, v in kwargs.items():
+        setattr(row, k, v)
+    return row
+
+
+class TestLatestContext:
+    """_compute_latest_context 在不同数据状态下的行为验证。"""
+
+    T = datetime(2026, 7, 23, 10, 0, 0, tzinfo=timezone.utc)
+
+    def _build_db(self, logs: list[Mock]) -> AsyncMock:
+        """构造 AsyncSession mock，execute + scalars + all 返回 logs。"""
+        db = AsyncMock(spec=["execute"])
+        result = Mock()
+        scalars_chain = Mock()
+        scalars_chain.all.return_value = logs
+        result.scalars.return_value = scalars_chain
+        db.execute = AsyncMock(return_value=result)
+        return db
+
+    @pytest.mark.asyncio
+    async def test_latest_row_has_valid_snapshot(self):
+        """最新一条日志有合法快照 → 直接返回该快照"""
+        db = self._build_db([
+            _make_api_log(
+                request_params={
+                    "context_snapshot": {
+                        "version": 1,
+                        "formatted_text": "valid context",
+                        "memory_count": 3,
+                        "generated_at": "2026-07-23T10:05:00+00:00",
+                        "trace_id": "trace_001",
+                    }
+                },
+                trace_id="trace_001",
+                created_at=self.T,
+            ),
+        ])
+        ctx = await _compute_latest_context(db, as_of=self.T)
+        assert ctx is not None
+        assert ctx.formatted_text == "valid context"
+        assert ctx.memory_count == 3
+        assert ctx.trace_id == "trace_001"
+
+    @pytest.mark.asyncio
+    async def test_latest_no_snapshot_fallback_to_older(self):
+        """最新日志无 context_snapshot，更早日志有 → 返回更早的有效快照"""
+        db = self._build_db([
+            # 最新：无快照
+            _make_api_log(
+                request_params={},
+                trace_id="trace_latest",
+                created_at=self.T,
+            ),
+            # 更早：有快照
+            _make_api_log(
+                request_params={
+                    "context_snapshot": {
+                        "version": 1,
+                        "formatted_text": "older valid context",
+                        "memory_count": 5,
+                        "generated_at": "2026-07-23T09:30:00+00:00",
+                        "trace_id": "trace_older",
+                    }
+                },
+                trace_id="trace_older",
+                created_at=self.T - timedelta(hours=1),
+            ),
+        ])
+        ctx = await _compute_latest_context(db, as_of=self.T)
+        assert ctx is not None
+        assert ctx.formatted_text == "older valid context"
+        assert ctx.memory_count == 5
+        assert ctx.trace_id == "trace_older"
+
+    @pytest.mark.asyncio
+    async def test_no_valid_snapshot_returns_none(self):
+        """没有任何有效快照时返回 None"""
+        db = self._build_db([
+            _make_api_log(request_params={}, trace_id="t1", created_at=self.T),
+            _make_api_log(
+                request_params={"context_snapshot": {"version": 2, "formatted_text": "x"}},
+                trace_id="t2", created_at=self.T - timedelta(hours=1),
+            ),
+            _make_api_log(
+                request_params=None,
+                trace_id="t3", created_at=self.T - timedelta(hours=2),
+            ),
+        ])
+        ctx = await _compute_latest_context(db, as_of=self.T)
+        assert ctx is None
+
+    @pytest.mark.asyncio
+    async def test_empty_formatted_text_skipped(self):
+        """formatted_text 为空字符串时跳过该记录"""
+        db = self._build_db([
+            _make_api_log(
+                request_params={
+                    "context_snapshot": {
+                        "version": 1,
+                        "formatted_text": "",
+                        "memory_count": 0,
+                        "generated_at": "2026-07-23T10:00:00+00:00",
+                    }
+                },
+                trace_id="t_empty",
+                created_at=self.T,
+            ),
+            _make_api_log(
+                request_params={
+                    "context_snapshot": {
+                        "version": 1,
+                        "formatted_text": "real content",
+                        "memory_count": 2,
+                        "generated_at": "2026-07-23T09:00:00+00:00",
+                    }
+                },
+                trace_id="t_real",
+                created_at=self.T - timedelta(hours=1),
+            ),
+        ])
+        ctx = await _compute_latest_context(db, as_of=self.T)
+        assert ctx is not None
+        assert ctx.formatted_text == "real content"
+        assert ctx.trace_id == "t_real"
+
+    @pytest.mark.asyncio
+    async def test_version_is_string_one(self):
+        """version 为字符串 "1" 也应该通过"""
+        db = self._build_db([
+            _make_api_log(
+                request_params={
+                    "context_snapshot": {
+                        "version": "1",
+                        "formatted_text": "string version",
+                        "memory_count": 1,
+                        "generated_at": "2026-07-23T10:00:00+00:00",
+                    }
+                },
+                trace_id="t_str",
+                created_at=self.T,
+            ),
+        ])
+        ctx = await _compute_latest_context(db, as_of=self.T)
+        assert ctx is not None
+        assert ctx.formatted_text == "string version"
+
+    @pytest.mark.asyncio
+    async def test_no_logs_returns_none(self):
+        """没有日志记录时返回 None"""
+        db = self._build_db([])
+        ctx = await _compute_latest_context(db, as_of=self.T)
+        assert ctx is None
+
+    @pytest.mark.asyncio
+    async def test_trace_id_fallback_to_row(self):
+        """快照无 trace_id 时回退到 ApiLog.trace_id"""
+        db = self._build_db([
+            _make_api_log(
+                request_params={
+                    "context_snapshot": {
+                        "version": 1,
+                        "formatted_text": "no trace in snapshot",
+                        "memory_count": 1,
+                        "generated_at": "2026-07-23T10:00:00+00:00",
+                        # 没有 trace_id
+                    }
+                },
+                trace_id="row_trace",
+                created_at=self.T,
+            ),
+        ])
+        ctx = await _compute_latest_context(db, as_of=self.T)
+        assert ctx is not None
+        assert ctx.trace_id == "row_trace"
+
+    @pytest.mark.asyncio
+    async def test_malformed_generated_at_fallback_to_created_at(self):
+        """generated_at 不是合法 ISO 8601 时回退到 row.created_at"""
+        db = self._build_db([
+            _make_api_log(
+                request_params={
+                    "context_snapshot": {
+                        "version": 1,
+                        "formatted_text": "bad date",
+                        "memory_count": 1,
+                        "generated_at": "not-a-date",
+                    }
+                },
+                trace_id="t_bad_date",
+                created_at=self.T,
+            ),
+        ])
+        ctx = await _compute_latest_context(db, as_of=self.T)
+        assert ctx is not None
+        assert ctx.formatted_text == "bad date"
+        # 应该回退到 row.created_at
+        assert ctx.generated_at == self.T
