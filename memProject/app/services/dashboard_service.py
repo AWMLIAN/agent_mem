@@ -115,7 +115,8 @@ async def _compute_summary(
         ok_ctx = await _count(
             db, select(func.count()).select_from(ApiLog).where(
                 ApiLog.api_path == "/api/v1/memory/context",
-                ApiLog.response_code == 0,
+                ApiLog.response_code >= 200,
+                ApiLog.response_code < 300,
                 ApiLog.created_at >= current_start,
                 ApiLog.created_at < as_of,
             )
@@ -227,7 +228,8 @@ async def _compute_comparison(
         ok = await _count(
             db, select(func.count()).select_from(ApiLog).where(
                 ApiLog.api_path == "/api/v1/memory/context",
-                ApiLog.response_code == 0,
+                ApiLog.response_code >= 200,
+                ApiLog.response_code < 300,
                 ApiLog.created_at >= start,
                 ApiLog.created_at < end,
             )
