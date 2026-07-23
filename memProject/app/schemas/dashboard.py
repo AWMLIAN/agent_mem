@@ -6,6 +6,7 @@ Dashboard 聚合接口 — 响应 Schema。
 """
 import datetime
 from datetime import datetime as _datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -44,7 +45,7 @@ class TypeDistributionItem(BaseModel):
 
 class RetrievalSignalItem(BaseModel):
     """检索信号分布项"""
-    signal: str = Field(..., description="检索模式 (vector_hybrid / db_fallback)")
+    signal: str = Field(..., description="检索模式 (hybrid / keyword)")
     count: int = Field(default=0, ge=0, description="该模式的请求数")
     ratio: float = Field(default=0.0, ge=0, le=1, description="占比")
 
@@ -71,9 +72,17 @@ class RecentRetrievalItem(BaseModel):
 class RecentAlertItem(BaseModel):
     """近期告警"""
     message: str = Field(..., description="告警信息（已脱敏）")
+    api_path: str | None = Field(None, description="告警接口路径")
     error_code: str | None = Field(None)
     trace_id: str | None = Field(None)
-    occurred_at: str | None = Field(None)
+    occurred_at: _datetime | None = Field(None)
+    status: Literal["active", "resolved", "historical"] = Field(
+        default="historical",
+        description="告警状态: active=当前故障, resolved=已恢复, historical=历史记录",
+    )
+    resolved_at: _datetime | None = Field(
+        None, description="恢复时间（status=resolved 时有效）"
+    )
 
 
 class RecentTaskItem(BaseModel):
@@ -84,19 +93,20 @@ class RecentTaskItem(BaseModel):
     updated_at: str | None = Field(None)
 
 
-class DashboardData(BaseModel):
-    """Dashboard 聚合响应"""
-    summary: DashboardSummary = Field(default_factory=DashboardSummary)
-    comparison: DashboardComparison = Field(default_factory=DashboardComparison)
-    memory_trend: list[TrendItem] = Field(default_factory=list)
-    memory_type_distribution: list[TypeDistributionItem] = Field(default_factory=list)
-    generation_summary: "GenerationSummary" = Field(default_factory="GenerationSummary")
-    retrieval_signal_distribution: list[RetrievalSignalItem] = Field(default_factory=list)
-    recent_agents: list[RecentAgentItem] = Field(default_factory=list)
-    recent_retrievals: list[RecentRetrievalItem] = Field(default_factory=list)
-    recent_alerts: list[RecentAlertItem] = Field(default_factory=list)
-    recent_tasks: list[RecentTaskItem] = Field(default_factory=list)
-    generated_at: _datetime = Field(..., description="统计快照时间 (UTC, ISO 8601)")
+class LatestContext(BaseModel):
+    """最近一次成功上下文调用快照"""
+    formatted_text: str = Field(..., description="LLM 生成的上下文摘要")
+    memory_count: int = Field(default=0, description="实际用于生成的去重后记忆条目数")
+    query: str | None = Field(None, description="原始查询问题")
+    return_mode: str | None = Field(None, description="返回模式: aggregation / snippet / full")
+    scope_type: str | None = Field(None, description="范围类型: task_view / session_context / user_profile")
+    user_id: str | None = Field(None)
+    agent_id: str | None = Field(None)
+    scene_id: str | None = Field(None)
+    session_id: str | None = Field(None)
+    task_id: str | None = Field(None)
+    generated_at: _datetime = Field(..., description="上下文生成时间 (UTC, ISO 8601)")
+    trace_id: str | None = Field(None, description="链路追踪 ID，用于追溯")
 
 
 class GenerationSummary(BaseModel):
@@ -106,3 +116,21 @@ class GenerationSummary(BaseModel):
     updated_count: int = Field(default=0, description="更新数 (update_existing)")
     discarded_count: int = Field(default=0, description="丢弃数 (discard)")
     conflict_count: int = Field(default=0, description="冲突数 (conflict)")
+
+
+class DashboardData(BaseModel):
+    """Dashboard 聚合响应"""
+    summary: DashboardSummary = Field(default_factory=DashboardSummary)
+    comparison: DashboardComparison = Field(default_factory=DashboardComparison)
+    memory_trend: list[TrendItem] = Field(default_factory=list)
+    memory_type_distribution: list[TypeDistributionItem] = Field(default_factory=list)
+    generation_summary: GenerationSummary = Field(default_factory=GenerationSummary)
+    retrieval_signal_distribution: list[RetrievalSignalItem] = Field(default_factory=list)
+    recent_agents: list[RecentAgentItem] = Field(default_factory=list)
+    recent_retrievals: list[RecentRetrievalItem] = Field(default_factory=list)
+    recent_alerts: list[RecentAlertItem] = Field(default_factory=list)
+    recent_tasks: list[RecentTaskItem] = Field(default_factory=list)
+    latest_context: LatestContext | None = Field(
+        default=None, description="最近一次成功上下文调用，无历史时返回 null"
+    )
+    generated_at: _datetime = Field(..., description="统计快照时间 (UTC, ISO 8601)")

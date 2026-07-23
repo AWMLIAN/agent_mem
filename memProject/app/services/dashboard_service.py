@@ -25,7 +25,7 @@ from app.models.base import (
 )
 from app.schemas.dashboard import (
     DashboardComparison, DashboardData, DashboardSummary,
-    GenerationSummary, RecentAgentItem, RecentAlertItem,
+    GenerationSummary, LatestContext, RecentAgentItem, RecentAlertItem,
     RecentRetrievalItem, RecentTaskItem, RetrievalSignalItem,
     TrendItem, TypeDistributionItem,
 )
@@ -564,9 +564,15 @@ async def _compute_recent_retrievals(
 
 # ── Recent Alerts ───────────────────────────────────────────
 async def _compute_recent_alerts(
-    db: AsyncSession, as_of: datetime,
+    db: AsyncSession, as_of: datetime, active_window: int = 30,
 ) -> list[RecentAlertItem]:
-    """最近系统告警 — 取 error_code 非空的失败调用。"""
+    """最近系统告警 — 取 error_code 非空的失败调用。
+
+    每条告警根据错误后同一路径的请求记录判断状态：
+      - resolved:   该错误后有同路径 2xx 成功请求
+      - active:     最近 active_window 分钟内仍无成功请求，且是该路径最新记录
+      - historical: 其他情况（旧记录、被更新错误覆盖等）
+    """
     rows = (
         await db.execute(
             select(
@@ -582,20 +588,149 @@ async def _compute_recent_alerts(
                 ApiLog.error_code != "",
                 ApiLog.created_at < as_of,
             )
-            .order_by(ApiLog.created_at.desc(), ApiLog.log_id.asc())
+            .order_by(ApiLog.created_at.desc(), ApiLog.log_id.desc())
             .limit(5)
         )
     ).all()
 
-    return [
-        RecentAlertItem(
+    if not rows:
+        return []
+
+    # 收集涉及的路径和最早期错误时间
+    paths = {r.api_path for r in rows if r.api_path}
+    earliest = min(r.created_at for r in rows)
+
+    # 批量查询这些路径的后续日志（从最早错误时间开始）
+    history_rows = (
+        await db.execute(
+            select(
+                ApiLog.api_path,
+                ApiLog.created_at,
+                ApiLog.response_code,
+            )
+            .where(
+                ApiLog.api_path.in_(paths),
+                ApiLog.created_at >= earliest,
+                ApiLog.created_at < as_of,
+            )
+            .order_by(ApiLog.api_path, ApiLog.created_at, ApiLog.log_id)
+        )
+    ).all()
+
+    # 按路径组织时间线
+    from collections import defaultdict
+    timeline: dict[str, list[tuple[datetime, int]]] = defaultdict(list)
+    for r in history_rows:
+        if r.api_path:
+            timeline[r.api_path].append((r.created_at, r.response_code))
+
+    # 判断每条告警的状态
+    now = datetime.now(timezone.utc)
+    alerts = []
+    for r in rows:
+        resolved_at = None
+        status = "historical"
+
+        path_events = timeline.get(r.api_path, [])
+        later = [(t, code) for t, code in path_events if t > r.created_at]
+        latest_for_path = path_events[-1] if path_events else None
+
+        # 检查是否有后续成功
+        first_success = next(((t, code) for t, code in later if 200 <= code < 300), None)
+        if first_success is not None:
+            status = "resolved"
+            resolved_at = first_success[0]
+        else:
+            is_latest = (
+                latest_for_path is not None
+                and latest_for_path[0] == r.created_at
+                and latest_for_path[1] == r.response_code
+            )
+            is_recent = (now - r.created_at).total_seconds() < active_window * 60
+            if is_latest and is_recent:
+                status = "active"
+
+        alerts.append(RecentAlertItem(
             message=f"接口 {r.api_path} 调用失败 (HTTP {r.response_code})",
+            api_path=r.api_path,
             error_code=r.error_code,
             trace_id=r.trace_id,
-            occurred_at=r.created_at.isoformat() if r.created_at else None,
+            occurred_at=r.created_at,
+            status=status,
+            resolved_at=resolved_at,
+        ))
+
+    # 后处理：同一路径多次失败被标记为 resolved 时，只保留最新一条
+    # 避免同一次故障显示多条"已恢复告警"
+    resolved_by_path: dict[str, bool] = {}
+    for alert in alerts:
+        if alert.status == "resolved" and alert.api_path:
+            if alert.api_path in resolved_by_path:
+                alert.status = "historical"
+                alert.resolved_at = None
+            else:
+                resolved_by_path[alert.api_path] = True
+
+    return alerts
+
+
+# ── Latest Context ──────────────────────────────────────────
+async def _compute_latest_context(
+    db: AsyncSession, as_of: datetime,
+) -> LatestContext | None:
+    """最近一次成功上下文调用的快照。
+
+    从 ApiLog 中查找最近一条成功 /api/v1/memory/context 记录，
+    其 request_params 中必须包含 context_snapshot.version == 1。
+    """
+    row = (
+        await db.execute(
+            select(ApiLog)
+            .where(
+                ApiLog.api_path == "/api/v1/memory/context",
+                ApiLog.response_code >= 200,
+                ApiLog.response_code < 300,
+                ApiLog.request_params["context_snapshot"]["version"].astext == "1",
+                ApiLog.created_at < as_of,
+            )
+            .order_by(ApiLog.created_at.desc(), ApiLog.log_id.desc())
+            .limit(1)
         )
-        for r in rows
-    ]
+    ).scalar_one_or_none()
+
+    if row is None or row.request_params is None:
+        return None
+
+    snap = row.request_params.get("context_snapshot")
+    if not isinstance(snap, dict):
+        return None
+    if snap.get("version") != 1:
+        return None
+    if not isinstance(snap.get("formatted_text"), str):
+        return None
+    if not snap.get("generated_at"):
+        return None
+
+    generated_at = None
+    try:
+        generated_at = datetime.fromisoformat(snap["generated_at"])
+    except (ValueError, TypeError):
+        return None  # generated_at 不可解析时视同无效快照
+
+    return LatestContext(
+        formatted_text=snap["formatted_text"],
+        memory_count=snap.get("memory_count", 0),
+        query=snap.get("query"),
+        return_mode=snap.get("return_mode"),
+        scope_type=snap.get("scope_type"),
+        user_id=snap.get("user_id"),
+        agent_id=snap.get("agent_id"),
+        scene_id=snap.get("scene_id"),
+        session_id=snap.get("session_id"),
+        task_id=snap.get("task_id"),
+        generated_at=generated_at,
+        trace_id=snap.get("trace_id") or row.trace_id,
+    )
 
 
 # ── Recent Tasks ────────────────────────────────────────────
@@ -662,6 +797,7 @@ async def get_dashboard_data(
     recent_retrievals = await _compute_recent_retrievals(db, as_of)
     recent_alerts = await _compute_recent_alerts(db, as_of)
     recent_tasks = await _compute_recent_tasks(db, as_of)
+    latest_context = await _compute_latest_context(db, as_of)
 
     data = DashboardData(
         summary=summary,
@@ -674,6 +810,7 @@ async def get_dashboard_data(
         recent_retrievals=recent_retrievals,
         recent_alerts=recent_alerts,
         recent_tasks=recent_tasks,
+        latest_context=latest_context,
         generated_at=as_of,
     )
 

@@ -134,6 +134,12 @@ class ApiLogMiddleware(BaseHTTPMiddleware):
         finally:
             elapsed_ms = round((time_module.perf_counter() - start) * 1000)
 
+            # 合并 context_snapshot（由 /context 端点设置，仅成功响应时附加）
+            if 200 <= response_code < 300:
+                snapshot = getattr(request.state, "context_snapshot", None)
+                if snapshot is not None:
+                    request_params["context_snapshot"] = snapshot
+
             # fire-and-forget 写入日志
             asyncio.create_task(
                 _write_api_log(

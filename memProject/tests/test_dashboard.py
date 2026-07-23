@@ -153,3 +153,38 @@ def test_A10_generated_at_format():
     # 应包含 T 和时区信息 (Z 或 +/-HH:MM)
     assert "T" in ts
     assert ts.endswith("Z") or "+" in ts[-6:] or "-" in ts[-6:]
+
+
+# ── BE-019: latest_context ──────────────────────────────────
+
+def test_BE019_latest_context_field_exists():
+    """latest_context 字段存在，无历史时为 null"""
+    r = httpx.get(f"{BASE}/dashboard", timeout=TIMEOUT)
+    body = r.json()
+    data = body["data"]
+    assert "latest_context" in data
+    # 允许 null（无历史时）或对象
+    assert data["latest_context"] is None or isinstance(data["latest_context"], dict)
+
+
+def test_BE019_latest_context_schema():
+    """latest_context 不为 null 时，必含 formatted_text / memory_count / generated_at"""
+    r = httpx.get(f"{BASE}/dashboard", timeout=TIMEOUT)
+    data = r.json()["data"]
+    ctx = data.get("latest_context")
+    if ctx is not None:
+        assert isinstance(ctx.get("formatted_text"), str)
+        assert isinstance(ctx.get("memory_count"), int)
+        assert isinstance(ctx.get("generated_at"), str)
+        assert "T" in ctx.get("generated_at", "")
+
+
+def test_BE019_alert_has_status():
+    """recent_alerts 每条记录包含 status 字段"""
+    r = httpx.get(f"{BASE}/dashboard", timeout=TIMEOUT)
+    alerts = r.json()["data"].get("recent_alerts", [])
+    for alert in alerts:
+        assert "status" in alert
+        assert alert["status"] in ("active", "resolved", "historical")
+        assert "api_path" in alert
+        assert "resolved_at" in alert

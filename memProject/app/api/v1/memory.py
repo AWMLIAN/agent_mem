@@ -813,6 +813,7 @@ async def memory_stats(
 @router.post("/context", summary="Prompt 上下文片段")
 async def memory_context(
     body: ContextRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     agent_id: str = Depends(get_current_agent),
 ):
@@ -823,8 +824,10 @@ async def memory_context(
     """
     try:
         aggregation = {}
+        scope_type = None
 
         if body.task_id:
+            scope_type = "task_view"
             task_view = await get_task_view(db, body.task_id)
             aggregation = {
                 "type": "task_view",
@@ -841,6 +844,7 @@ async def memory_context(
             }
 
         elif body.session_id:
+            scope_type = "session_context"
             sess_ctx = await get_session_context(db, body.session_id)
             by_type_clean = {
                 k: [item["content"] for item in v]
@@ -857,6 +861,7 @@ async def memory_context(
             }
 
         elif body.include_preferences or body.include_facts:
+            scope_type = "user_profile"
             profile = await get_user_profile(db, body.user_id)
             aggregation = {
                 "type": "user_profile",
@@ -891,6 +896,26 @@ async def memory_context(
                 }], max_tokens=body.max_tokens or 500)
             except Exception:
                 pass
+
+        # 设置 context_snapshot 供日志中间件合并到 ApiLog
+        generated_at = datetime.now(timezone.utc)
+        trace_id = getattr(request.state, "trace_id", None)
+        request.state.context_snapshot = {
+            "version": 1,
+            "query": body.query,
+            "formatted_text": formatted_text,
+            "memory_count": len(contents),
+            "memory_ids": [],  # TODO: 从聚合来源记录原始 memory_id，当前仅追踪数量
+            "return_mode": "aggregation",
+            "scope_type": scope_type,
+            "user_id": body.user_id,
+            "agent_id": agent_id,
+            "scene_id": body.scene_id,
+            "session_id": body.session_id,
+            "task_id": body.task_id,
+            "generated_at": generated_at.isoformat(),
+            "trace_id": trace_id,
+        }
 
         return ok({
             "aggregation": aggregation,
